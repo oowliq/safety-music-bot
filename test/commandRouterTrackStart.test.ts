@@ -1,0 +1,265 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+
+import { CommandRouter } from '../src/bot/commandRouter.ts';
+import { createTranslator } from '../src/i18n/index.ts';
+
+function createRouter(sessions: EventEmitter) {
+  return new CommandRouter({
+    config: {
+      prefix: '!',
+      enableEmbeds: true,
+      commandRateLimitEnabled: false,
+      commandUserWindowMs: 10_000,
+      commandUserMax: 10,
+      commandGuildWindowMs: 10_000,
+      commandGuildMax: 100,
+      commandRateLimitBypass: [],
+      sessionIdleMs: 300_000,
+    },
+    rest: {
+      async sendTyping() {},
+      async sendMessage() {
+        return { id: 'message-1' };
+      },
+      async editMessage() {},
+    },
+    gateway: {
+      on() {},
+      off() {},
+    },
+    sessions: sessions as unknown as ConstructorParameters<typeof CommandRouter>[0]['sessions'],
+    guildConfigs: null,
+    voiceStateStore: {
+      countUsersInChannel() {
+        return 1;
+      },
+    },
+    lyrics: null,
+    library: null,
+    permissionService: null,
+    botUserId: 'bot-1',
+    startedAt: Date.now(),
+  } as ConstructorParameters<typeof CommandRouter>[0]);
+}
+
+test('trackStart popup includes the active voice channel mention', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const calls: Array<{ channelId: string; type: string; text: string }> = [];
+
+  router._safeReply = (async (channelId: string, type: string, text: string) => {
+    calls.push({ channelId, type, text });
+    return null;
+  }) as CommandRouter['_safeReply'];
+
+  try {
+    sessions.emit('trackStart', {
+      session: {
+        textChannelId: 'text-1',
+        connection: { channelId: 'voice-1' },
+        settings: {},
+      },
+      track: {
+        title: 'Demo Track',
+        duration: '3:00',
+        source: 'youtube',
+      },
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  assert.deepEqual(calls, [{
+    channelId: 'text-1',
+    type: 'info',
+    text: 'Now playing in <#voice-1>: **Demo Track** (3:00)',
+  }]);
+});
+
+test('trackStart popup waits briefly for deferred metadata before sending', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const calls: Array<{ channelId: string; type: string; text: string }> = [];
+  const track = {
+    title: 'YouTube Track',
+    duration: 'Unknown',
+    source: 'youtube',
+    metadataDeferred: true,
+  };
+
+  router._safeReply = (async (channelId: string, type: string, text: string) => {
+    calls.push({ channelId, type, text });
+    return null;
+  }) as CommandRouter['_safeReply'];
+
+  try {
+    sessions.emit('trackStart', {
+      session: {
+        textChannelId: 'text-1',
+        connection: { channelId: 'voice-1' },
+        settings: {},
+      },
+      track,
+    });
+
+    setTimeout(() => {
+      track.title = 'Hydrated Track';
+      track.duration = '3:33';
+      track.metadataDeferred = false;
+    }, 10);
+
+    await new Promise((resolve) => setTimeout(resolve, 1250));
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  assert.deepEqual(calls, [{
+    channelId: 'text-1',
+    type: 'info',
+    text: 'Now playing in <#voice-1>: **Hydrated Track** (3:33)',
+  }]);
+});
+
+test('now playing embed links the track title instead of the heading', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const payloads: Array<Record<string, unknown>> = [];
+
+  router.rest.sendMessage = (async (_channelId: string, payload: Record<string, unknown>) => {
+    payloads.push(payload);
+    return { id: 'message-1' };
+  }) as CommandRouter['rest']['sendMessage'];
+
+  try {
+    const published = await router._publishNowPlaying(
+      { guildId: 'guild-1', settings: {}, connection: { channelId: 'voice-1' } } as never,
+      { title: 'Loser', duration: '3:43', url: 'https://www.deezer.com/track/3602329332', source: 'deezer', requestedBy: '42' },
+      'text-1',
+      ' in <#voice-1>',
+      createTranslator('en'),
+    );
+
+    assert.equal(published, true);
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  const embed = (payloads[0] as { embeds: Array<Record<string, unknown>> }).embeds[0];
+  assert.equal(embed?.url, undefined);
+  assert.equal(embed?.title, 'Now playing in <#voice-1>');
+  assert.equal(
+    embed?.description,
+    '[**Loser**](<https://www.deezer.com/track/3602329332>) `3:43` | <@42>'
+  );
+});
+
+test('now playing embed falls back to plain text when the track has no url', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const payloads: Array<Record<string, unknown>> = [];
+
+  router.rest.sendMessage = (async (_channelId: string, payload: Record<string, unknown>) => {
+    payloads.push(payload);
+    return { id: 'message-2' };
+  }) as CommandRouter['rest']['sendMessage'];
+
+  try {
+    await router._publishNowPlaying(
+      { guildId: 'guild-1', settings: {} } as never,
+      { title: 'Local File', duration: '2:10', source: 'youtube' },
+      'text-1',
+      '',
+      createTranslator('en'),
+    );
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  const embed = (payloads[0] as { embeds: Array<Record<string, unknown>> }).embeds[0];
+  assert.equal(embed?.url, undefined);
+  assert.equal(embed?.description, '**Local File** `2:10`');
+});
+
+test('two sessions in one guild each keep editing their own now playing message', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const sent: string[] = [];
+  const edited: string[] = [];
+  let nextId = 0;
+
+  router.rest.sendMessage = (async (channelId: string) => {
+    sent.push(channelId);
+    nextId += 1;
+    return { id: `message-${nextId}` };
+  }) as CommandRouter['rest']['sendMessage'];
+  router.rest.editMessage = (async (channelId: string, messageId: string) => {
+    edited.push(`${channelId}/${messageId}`);
+    return { id: messageId };
+  }) as CommandRouter['rest']['editMessage'];
+
+  const music = { guildId: 'guild-1', sessionId: 'guild-1:voice-music', settings: {} };
+  const chill = { guildId: 'guild-1', sessionId: 'guild-1:voice-chill', settings: {} };
+  const publish = (session: typeof music, channelId: string, title: string) => router._publishNowPlaying(
+    session as never,
+    { title, duration: '4:20', source: 'youtube' },
+    channelId,
+    '',
+    createTranslator('en'),
+  );
+
+  try {
+    await publish(music, 'text-music', 'Libertas');
+    await publish(chill, 'text-chill', 'Let\'s Groove');
+    await publish(music, 'text-music', 'Libertas');
+    await publish(chill, 'text-chill', 'Let\'s Groove');
+    await publish(music, 'text-music', 'Libertas');
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  assert.deepEqual(sent, ['text-music', 'text-chill']);
+  assert.deepEqual(edited, ['text-music/message-1', 'text-chill/message-2', 'text-music/message-1']);
+});
+
+test('trackStart popup is suppressed for persistent session restore playback', async () => {
+  const sessions = new EventEmitter();
+  const router = createRouter(sessions);
+  const calls: Array<{ channelId: string; type: string; text: string }> = [];
+
+  router._safeReply = (async (channelId: string, type: string, text: string) => {
+    calls.push({ channelId, type, text });
+    return null;
+  }) as CommandRouter['_safeReply'];
+
+  try {
+    sessions.emit('trackStart', {
+      session: {
+        textChannelId: 'text-1',
+        connection: { channelId: 'voice-1' },
+        settings: {},
+      },
+      track: {
+        title: 'Restored Track',
+        duration: '3:00',
+        source: 'youtube',
+      },
+      restoredFromPersistentSession: true,
+    });
+
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    if (router.weeklySweepHandle) clearInterval(router.weeklySweepHandle);
+    if (router.ephemeralCleanupHandle) clearInterval(router.ephemeralCleanupHandle);
+  }
+
+  assert.deepEqual(calls, []);
+});

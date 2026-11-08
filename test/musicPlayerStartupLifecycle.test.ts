@@ -1,0 +1,302 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+
+import { MusicPlayer } from '../src/player/MusicPlayer.ts';
+
+type FakeProcess = EventEmitter & {
+  stdout: PassThrough;
+  stderr: PassThrough;
+  stdin: PassThrough;
+  killCalls: string[];
+  kill: (signal?: string | number) => void;
+};
+
+type VoiceMock = {
+  stopCalls: number;
+  sendAudio: () => Promise<void>;
+  stopAudio: () => void;
+};
+
+function createVoice() {
+  return {
+    stopCalls: 0,
+    async sendAudio() {},
+    stopAudio() {
+      this.stopCalls += 1;
+    },
+  } as VoiceMock;
+}
+
+function createFakeProcess(): FakeProcess {
+  const proc = new EventEmitter() as FakeProcess;
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.stdin = new PassThrough();
+  proc.killCalls = [];
+  proc.kill = (signal) => {
+    proc.killCalls.push(String(signal ?? 'SIGTERM'));
+  };
+  return proc;
+}
+
+test('stop() aborts startup without emitting startup errors or trackStart', async () => {
+  const voice = createVoice();
+  const player = new MusicPlayer(voice, { logger: null });
+  const sourceProc = createFakeProcess();
+  const ffmpeg = createFakeProcess();
+  let releaseStartupChunk: (() => void) | null = null;
+
+  player._startHttpUrlPipeline = async () => {
+    player.sourceProc = sourceProc;
+    player.ffmpeg = ffmpeg;
+  };
+  player._awaitInitialPlaybackChunk = async () => new Promise<void>((resolve) => {
+    releaseStartupChunk = () => resolve();
+  });
+
+  let trackStartCount = 0;
+  let trackErrorCount = 0;
+  player.on('trackStart', () => {
+    trackStartCount += 1;
+  });
+  player.on('trackError', () => {
+    trackErrorCount += 1;
+  });
+
+  player.enqueueResolvedTracks([
+    player._buildTrack({
+      title: 'Startup Track',
+      url: 'https://audio.example.com/demo.mp3',
+      duration: '03:00',
+      source: 'http-audio',
+      requestedBy: 'user-1',
+    }),
+  ]);
+
+  const playPromise = player.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  player.stop();
+  const finishStartup = releaseStartupChunk;
+  assert.equal(typeof finishStartup, 'function');
+  if (finishStartup) {
+    (finishStartup as () => void)();
+  }
+  await playPromise;
+
+  assert.equal(trackStartCount, 0);
+  assert.equal(trackErrorCount, 0);
+  assert.equal(player.playing, false);
+  assert.equal(player.currentTrack, null);
+  assert.deepEqual(sourceProc.killCalls, ['SIGKILL']);
+  assert.deepEqual(ffmpeg.killCalls, ['SIGKILL']);
+});
+
+test('play() cleans up lingering processes before starting a new track', async () => {
+  const voice = createVoice();
+  const player = new MusicPlayer(voice, { logger: null });
+  const staleSourceProc = createFakeProcess();
+  const staleFfmpeg = createFakeProcess();
+  const nextFfmpeg = createFakeProcess();
+
+  player.sourceProc = staleSourceProc;
+  player.ffmpeg = staleFfmpeg;
+  player._startHttpUrlPipeline = async () => {
+    player.ffmpeg = nextFfmpeg;
+    player.sourceProc = null;
+  };
+  player._awaitInitialPlaybackChunk = async () => {};
+
+  player.enqueueResolvedTracks([
+    player._buildTrack({
+      title: 'Fresh Track',
+      url: 'https://audio.example.com/fresh.mp3',
+      duration: '03:00',
+      source: 'http-audio',
+      requestedBy: 'user-1',
+    }),
+  ]);
+
+  await player.play();
+
+  assert.deepEqual(staleSourceProc.killCalls, ['SIGKILL']);
+  assert.deepEqual(staleFfmpeg.killCalls, ['SIGKILL']);
+  assert.equal(player.ffmpeg, nextFfmpeg);
+  assert.equal(player.playing, true);
+});
+
+test('_handleTrackClose auto-recovers early-ended NodeLink tracks with NodeLink retry first', async () => {
+  const warnings: Array<{ message: string; meta: Record<string, unknown> | undefined }> = [];
+  const player = new MusicPlayer(createVoice(), {
+    logger: {
+      warn(message: string, meta?: Record<string, unknown>) {
+        warnings.push({ message, meta });
+      },
+    },
+  });
+
+  const track = player.createTrackFromData({
+    title: 'NodeLink YouTube Track',
+    url: 'https://www.youtube.com/watch?v=abcdefghijk',
+    duration: '03:40',
+    source: 'youtube',
+    requestedBy: 'user-1',
+    nodelinkEncodedTrack: 'encoded-node-track',
+    nodelinkInfo: { sourceName: 'youtube' },
+  });
+
+  let playCalls = 0;
+  player.play = async () => {
+    playCalls += 1;
+  };
+  player.getProgressSeconds = () => 32;
+  player.queue.current = track;
+  player.playing = true;
+
+  await player._handleTrackClose(track, 0, null);
+
+  const resumedTrack = player.pendingTracks[0] as ({ recoveryAttemptCount?: number; nodelinkEncodedTrack?: unknown } & Record<string, unknown>) | undefined;
+
+  assert.equal(playCalls, 1);
+  assert.equal(resumedTrack?.title, track.title);
+  assert.equal(resumedTrack?.seekStartSec, 30);
+  assert.equal(resumedTrack?.recoveryAttemptCount, 1);
+  assert.equal(resumedTrack?.nodelinkEncodedTrack ?? null, 'encoded-node-track');
+  assert.ok(warnings.some(({ message, meta }) => (
+    message === 'Scheduling automatic playback recovery after early track close'
+    && meta?.backend === 'nodelink-retry'
+    && meta?.recoverySeekSec === 30
+  )));
+});
+
+test('_handleTrackClose keeps the NodeLink track on the second retry in NodeLink-only mode', async () => {
+  const player = new MusicPlayer(createVoice(), {
+    logger: null,
+    nodeLinkBaseUrl: 'http://nodelink:3000',
+    nodeLinkPassword: 'secret',
+  });
+
+  const track = player.createTrackFromData({
+    title: 'NodeLink Only Track',
+    url: 'https://www.youtube.com/watch?v=abcdefghijk',
+    duration: '03:40',
+    source: 'youtube',
+    requestedBy: 'user-1',
+    nodelinkEncodedTrack: 'encoded-node-track',
+    nodelinkInfo: { sourceName: 'youtube' },
+  }) as ({ recoveryAttemptCount?: number } & ReturnType<MusicPlayer['createTrackFromData']>);
+  track.recoveryAttemptCount = 1;
+
+  player.play = async () => {};
+  player.getProgressSeconds = () => 36;
+  player.queue.current = track;
+  player.playing = true;
+
+  await player._handleTrackClose(track, 0, null);
+
+  const resumedTrack = player.pendingTracks[0] as ({ recoveryAttemptCount?: number; nodelinkEncodedTrack?: unknown } & Record<string, unknown>) | undefined;
+  assert.equal(resumedTrack?.recoveryAttemptCount, 2);
+  assert.equal(resumedTrack?.nodelinkEncodedTrack ?? null, 'encoded-node-track');
+});
+
+test('stop() during startup is not counted as a failed startup when the torn down pipeline rejects', async () => {
+  const voice = createVoice();
+  const player = new MusicPlayer(voice, { logger: null });
+  const pendingChunk: { reject?: (err: Error) => void } = {};
+  let pipelineStarts = 0;
+
+  player._startHttpUrlPipeline = async () => {
+    pipelineStarts += 1;
+    player.sourceProc = createFakeProcess();
+    player.ffmpeg = createFakeProcess();
+  };
+  player._awaitInitialPlaybackChunk = () => new Promise<void>((_resolve, reject) => {
+    pendingChunk.reject = reject;
+  });
+
+  let trackStartCount = 0;
+  let trackErrorCount = 0;
+  player.on('trackStart', () => {
+    trackStartCount += 1;
+  });
+  player.on('trackError', () => {
+    trackErrorCount += 1;
+  });
+
+  player.enqueueResolvedTracks([
+    player._buildTrack({
+      title: 'Stopped During Startup',
+      url: 'https://audio.example.com/stop.mp3',
+      duration: '03:00',
+      source: 'http-audio',
+      requestedBy: 'user-1',
+    }),
+  ]);
+
+  const playPromise = player.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  player.stop();
+  pendingChunk.reject?.(new Error('Playback pipeline exited before audio output (signal=SIGKILL).'));
+  await playPromise;
+
+  assert.equal(pipelineStarts, 1);
+  assert.equal(trackStartCount, 0);
+  assert.equal(trackErrorCount, 0);
+  assert.equal(player.playing, false);
+});
+
+test('skip() during a NodeLink startup moves on instead of replaying the skipped track', async () => {
+  const voice = createVoice();
+  const player = new MusicPlayer(voice, {
+    logger: null,
+    nodeLinkBaseUrl: 'http://nodelink:3000',
+  });
+  const pendingStream: { reject?: (err: Error) => void } = {};
+  const startedTitles: string[] = [];
+  let mirrorFailures = 0;
+
+  player._noteMirrorSourceFailure = () => {
+    mirrorFailures += 1;
+  };
+  player._startNodeLinkStream = async (track) => {
+    startedTitles.push(String(track.title));
+    if (startedTitles.length === 1) {
+      await new Promise<void>((_resolve, reject) => {
+        pendingStream.reject = reject;
+      });
+    }
+    player.queue.current = track;
+  };
+
+  player.enqueueResolvedTracks([
+    player.createTrackFromData({
+      title: 'Skipped Track',
+      url: 'https://www.youtube.com/watch?v=skip1234567',
+      duration: '03:00',
+      source: 'youtube',
+      nodelinkEncodedTrack: 'encoded-skipped',
+      requestedBy: 'user-1',
+    }),
+    player.createTrackFromData({
+      title: 'Next Track',
+      url: 'https://www.youtube.com/watch?v=next1234567',
+      duration: '03:00',
+      source: 'youtube',
+      nodelinkEncodedTrack: 'encoded-next',
+      requestedBy: 'user-1',
+    }),
+  ]);
+
+  const playPromise = player.play();
+  await new Promise((resolve) => setImmediate(resolve));
+  player.skip();
+  pendingStream.reject?.(new Error('NodeLink stream closed before audio output'));
+  await playPromise;
+  for (let attempt = 0; attempt < 20 && startedTitles.length < 2; attempt += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  assert.deepEqual(startedTitles, ['Skipped Track', 'Next Track']);
+  assert.equal(mirrorFailures, 0);
+});

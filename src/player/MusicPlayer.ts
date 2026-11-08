@@ -1,0 +1,1057 @@
+import { EventEmitter } from 'events';
+import { sourceMethods } from './musicPlayer/sourceMethods.ts';
+import { ResolverClient } from './musicPlayer/ResolverClient.ts';
+import { NodeLinkClient } from './musicPlayer/NodeLinkClient.ts';
+import type { NodeLinkLoadResult } from './musicPlayer/NodeLinkClient.ts';
+import { playbackStateMethods } from './musicPlayer/playbackStateMethods.ts';
+import type { PlaybackStateMethods } from './musicPlayer/playbackStateMethods.ts';
+import type { UrlResolverMethods } from './musicPlayer/urlResolverMethods.ts';
+import { queueLifecycleMethods } from './musicPlayer/queueLifecycleMethods.ts';
+import type { QueueLifecycleMethods } from './musicPlayer/queueLifecycleMethods.ts';
+import type { NodeLinkMethods } from './musicPlayer/nodeLinkMethods.ts';
+import type { TrackRuntimeMethods } from './musicPlayer/trackRuntimeMethods.ts';
+import type { TrackFactoryMethods } from './musicPlayer/trackFactoryMethods.ts';
+import { resolverMethods, shouldMirrorFailedStartup } from './musicPlayer/resolverMethods.ts';
+import type { ResolverMethodMembers } from './musicPlayer/resolverMethods.ts';
+import { nodeLinkMethods } from './musicPlayer/nodeLinkMethods.ts';
+import { pipelineMethods } from './musicPlayer/pipelineMethods.ts';
+import type { PipelineMethodMembers } from './musicPlayer/pipelineMethods.ts';
+import { trackRuntimeMethods } from './musicPlayer/trackRuntimeMethods.ts';
+import { Queue } from './Queue.ts';
+import { LiveAudioProcessor } from './LiveAudioProcessor.ts';
+import type { SpectrumAnalyzer } from './audio/SpectrumAnalyzer.ts';
+import { ValidationError } from '../core/errors.ts';
+import {
+  LOOP_OFF,
+} from './musicPlayer/constants.ts';
+import {
+  isHttpUrl,
+  isYouTubeUrl,
+} from './musicPlayer/trackUtils.ts';
+import {
+  bindPipelineErrorHandler,
+  cleanupProcesses,
+  normalizePlaybackError,
+  resetPlaybackClock,
+  startPlaybackClock,
+  stopVoiceStream,
+} from './musicPlayer/processUtils.ts';
+import type { LoggerLike } from '../types/core.ts';
+import type { PipelineProcess, Track } from '../types/domain.ts';
+
+const NORMALIZED_INPUT_URL_CACHE_MAX_SIZE = 500;
+const STARTUP_FAILURE_STREAK_LIMIT = 3;
+const MIRROR_ATTEMPT_CEILING = 8;
+const MIRROR_SOURCE_COOLDOWN_FAILURES = 3;
+const MIRROR_SOURCE_COOLDOWN_MS = 10 * 60_000;
+const PUMP_RECOVERY_WINDOW_MS = 30_000;
+const PUMP_RECOVERY_MAX_ATTEMPTS = 3;
+const NODELINK_STALL_TIMEOUT_MS = 12_000;
+const NODELINK_STALL_CHECK_INTERVAL_MS = 2_000;
+
+function getStartupRetryAttempt(track: Track | null | undefined): number {
+  const rawValue = (track as (Track & { startupRetryCount?: unknown }) | null | undefined)?.startupRetryCount;
+  const parsed = Number.parseInt(String(rawValue ?? 0), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+interface VoiceAdapterLike {
+  sendAudio?: (stream: unknown) => Promise<unknown>;
+  isStreaming?: boolean;
+  connected?: boolean;
+  channelId?: string | null;
+  pauseAudio?: () => unknown;
+  resumeAudio?: () => unknown;
+  getDiagnostics?: () => Promise<unknown>;
+  onAudioPumpFatalError?: (() => void) | null;
+  onReconnected?: (() => void) | null;
+  waitForPlaybackDrain?: (timeoutMs?: number) => Promise<void>;
+}
+
+class PlaybackStartupAbortedError extends Error {
+  constructor(message = 'Playback startup aborted.') {
+    super(message);
+    this.name = 'PlaybackStartupAbortedError';
+  }
+}
+
+interface MusicPlayerOptions {
+  logger?: LoggerLike | null | undefined;
+  ffmpegBin?: string | null;
+  maxQueueSize?: number;
+  maxTrackLengthHours?: number;
+  maxPlaylistTracks?: number;
+  minVolumePercent?: number;
+  maxVolumePercent?: number;
+  nodeLinkBaseUrl?: string | null;
+  nodeLinkPassword?: string | null;
+  nodeLinkDefaultSearch?: string | null;
+  nodeLinkMirrorSearchOrder?: string | null;
+  nodeLinkRequestTimeoutMs?: number | null;
+  nodeLinkStreamStartTimeoutMs?: number | null;
+  defaultVolumePercent?: number;
+  maxHistorySize?: number;
+}
+
+interface QueueGuardOption {
+  enabled?: boolean;
+  windowSize?: number;
+  maxPerRequesterWindow?: number;
+  maxArtistStreak?: number;
+  [key: string]: unknown;
+}
+
+interface EnqueueOptions {
+  requestedBy?: string | null;
+  playNext?: boolean;
+  dedupe?: boolean;
+  queueGuard?: QueueGuardOption | null;
+}
+
+type PipelineStreamLike = NonNullable<PipelineProcess['stdout']>;
+type SourceProcessCloseInfo = {
+  code: number | null;
+  signal: string | null;
+  atMs: number;
+  stderrTail: string | null;
+  url: string | null;
+};
+
+export class MusicPlayer extends EventEmitter {
+  spectrumEnabled = false;
+  voice: VoiceAdapterLike;
+  queue: Queue<Track>;
+  logger: LoggerLike | undefined;
+  ffmpegBin: string;
+  maxQueueSize: number;
+  maxTrackLengthMs: number;
+  maxPlaylistTracks: number;
+  minVolumePercent: number;
+  maxVolumePercent: number;
+  nodeLinkEnabled: boolean;
+  nodeLinkMirrorSearchOrder: string[];
+  mirrorSourceCooldowns = new Map<string, { failures: number; until: number }>();
+  nodeLinkClient: NodeLinkClient;
+  _nodeLinkResolveCache: Map<string, { result: NodeLinkLoadResult; expiresAtMs: number }>;
+  _isrcMirrorLookupMisses: number;
+  filterPreset: string;
+  eqPreset: string;
+  tempoRatio: number;
+  pitchSemitones: number;
+  volumePercent: number;
+  streamAppliedVolumePercent: number;
+  loopMode: string;
+  ffmpeg: PipelineProcess | null;
+  sourceProc: PipelineProcess | null;
+  sourceStream: PipelineStreamLike | null;
+  playbackSourceStream: PipelineStreamLike | null;
+  liveAudioProcessor: LiveAudioProcessor | null;
+  playbackOutputStream: SpectrumAnalyzer | null;
+  pipelineErrorHandlers: Array<unknown>;
+  sources: Readonly<{
+    resolver: ResolverClient;
+  }>;
+  playing: boolean;
+  paused: boolean;
+  skipRequested: boolean;
+  pendingSeekTrack: Track | null;
+  trackHistory: Track[];
+  maxHistorySize: number;
+  trackStartedAtMs: number | null;
+  pauseStartedAtMs: number | null;
+  totalPausedMs: number;
+  currentTrackOffsetSec: number;
+  receivedPcmBytes: number | null;
+  liveStreamStderrTail: string | null;
+  lastKnownTrack: Track | null;
+  lastKnownTrackAtMs: number;
+  activePlaybackToken: number;
+  playbackStartupToken: number;
+  nextPlaybackStartupHint: string | null;
+  _lastFfmpegArgs: string[] | null;
+  normalizedInputUrlCache: Map<string, { url: string; expiresAtMs: number }>;
+  consecutiveStartupFailures: number;
+  activeSourceProcessCloseInfo: SourceProcessCloseInfo | null;
+  _lastPumpRecoveryAtMs: number;
+  _pumpRecoveryCount: number;
+
+  constructor(voice: VoiceAdapterLike, options: MusicPlayerOptions = {}) {
+    super();
+    this.voice = voice;
+    this.queue = new Queue();
+    this.logger = options.logger ?? undefined;
+    this.ffmpegBin = options.ffmpegBin || process.env.FFMPEG_BIN || 'ffmpeg';
+    this.maxQueueSize = options.maxQueueSize ?? 100;
+    this.maxTrackLengthMs = Math.max(0, (options.maxTrackLengthHours ?? 6) * 3_600_000);
+    this.maxPlaylistTracks = options.maxPlaylistTracks ?? 25;
+    this.minVolumePercent = options.minVolumePercent ?? 0;
+    this.maxVolumePercent = options.maxVolumePercent ?? 200;
+    this.nodeLinkMirrorSearchOrder = String(
+      options.nodeLinkMirrorSearchOrder
+      ?? process.env.NODELINK_MIRROR_SEARCH_ORDER
+      ?? 'dzsearch,tdsearch,scsearch,ytsearch,ytmsearch',
+    )
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    // Hardened fork: NodeLink is the only resolver/streamer for provider sources.
+    this.nodeLinkEnabled = true;
+    this.nodeLinkClient = new NodeLinkClient({
+      baseUrl: options.nodeLinkBaseUrl ?? process.env.NODELINK_BASE_URL ?? null,
+      password: options.nodeLinkPassword ?? process.env.NODELINK_PASSWORD ?? null,
+      defaultSearchIdentifier: options.nodeLinkDefaultSearch ?? process.env.NODELINK_DEFAULT_SEARCH ?? null,
+      requestTimeoutMs: options.nodeLinkRequestTimeoutMs ?? null,
+      streamStartTimeoutMs: options.nodeLinkStreamStartTimeoutMs ?? null,
+    });
+    this._nodeLinkResolveCache = new Map();
+    this._isrcMirrorLookupMisses = 0;
+    this.filterPreset = 'off';
+    this.eqPreset = 'flat';
+    this.tempoRatio = 1.0;
+    this.pitchSemitones = 0;
+    this.volumePercent = options.defaultVolumePercent ?? 100;
+    this.streamAppliedVolumePercent = 100;
+    this.loopMode = LOOP_OFF;
+
+    this.ffmpeg = null;
+    this.sourceProc = null;
+    this.sourceStream = null;
+    this.playbackSourceStream = null;
+    this.liveAudioProcessor = null;
+    this.playbackOutputStream = null;
+    this.pipelineErrorHandlers = [];
+    this.sources = Object.freeze({
+      resolver: new ResolverClient(this),
+    });
+
+    this.playing = false;
+    this.paused = false;
+    this.skipRequested = false;
+
+    this.pendingSeekTrack = null;
+    this.trackHistory = [];
+    this.maxHistorySize = options.maxHistorySize ?? 100;
+    this.trackStartedAtMs = null;
+    this.pauseStartedAtMs = null;
+    this.totalPausedMs = 0;
+    this.currentTrackOffsetSec = 0;
+    this.receivedPcmBytes = null;
+    this.liveStreamStderrTail = null;
+    this.lastKnownTrack = null;
+    this.lastKnownTrackAtMs = 0;
+    this.activePlaybackToken = 0;
+    this.playbackStartupToken = 0;
+    this.nextPlaybackStartupHint = null;
+    this._lastFfmpegArgs = null;
+    this.normalizedInputUrlCache = new Map();
+    this.consecutiveStartupFailures = 0;
+    this.activeSourceProcessCloseInfo = null;
+    this._lastPumpRecoveryAtMs = 0;
+    this._pumpRecoveryCount = 0;
+    if (this.voice && typeof this.voice === 'object') {
+      (this.voice as VoiceAdapterLike).onAudioPumpFatalError = () => this._handleVoicePumpFatalError();
+      (this.voice as VoiceAdapterLike).onReconnected = () => this._handleVoiceReconnected();
+    }
+  }
+
+  _handleVoicePumpFatalError(): void {
+    if (!this.playing || !this.currentTrack) return;
+
+    const now = Date.now();
+    if (now - this._lastPumpRecoveryAtMs > PUMP_RECOVERY_WINDOW_MS) {
+      this._pumpRecoveryCount = 0;
+    }
+    this._lastPumpRecoveryAtMs = now;
+    this._pumpRecoveryCount += 1;
+
+    if (this._pumpRecoveryCount > PUMP_RECOVERY_MAX_ATTEMPTS) {
+      this.logger?.error?.('Audio pump recovery limit reached, skipping track', {
+        title: this.currentTrack?.title ?? null,
+        attempts: this._pumpRecoveryCount,
+      });
+      this._pumpRecoveryCount = 0;
+      try {
+        this.skip();
+      } catch {
+      }
+      return;
+    }
+
+    this.logger?.warn?.('Recovering playback after fatal audio pump error', {
+      title: this.currentTrack?.title ?? null,
+      attempt: this._pumpRecoveryCount,
+      progressSec: typeof this.getProgressSeconds === 'function' ? this.getProgressSeconds() : null,
+    });
+    this.refreshCurrentTrackProcessing();
+  }
+
+  _handleVoiceReconnected(): void {
+    if (this.playing) return;
+    if (this.queue.pendingSize <= 0) return;
+    if (!this.voice?.connected) return;
+
+    this.logger?.info?.('Voice reconnected, resuming playback', {
+      guildId: String((this.voice as { guildId?: unknown } | null | undefined)?.guildId ?? '').trim() || null,
+      pendingTracks: this.queue.pendingSize,
+    });
+    this.play().catch((err: unknown) => {
+      this.logger?.warn?.('Failed to resume playback after voice reconnect', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }
+
+  async _drainPlaybackBeforeClose(): Promise<void> {
+    if (this.skipRequested || this.pendingSeekTrack) return;
+
+    const voice = this.voice as VoiceAdapterLike | null | undefined;
+    const drain = voice?.waitForPlaybackDrain;
+    if (typeof drain !== 'function') return;
+
+    try {
+      await drain.call(voice);
+    } catch (err) {
+      this.logger?.debug?.('Playback drain before track close failed', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  _setNormalizedInputUrlCacheEntry(key: string, value: { url: string; expiresAtMs: number }): void {
+    this._pruneExpiredNormalizedInputUrlCacheEntries();
+    this.normalizedInputUrlCache.delete(key);
+    this.normalizedInputUrlCache.set(key, value);
+    while (this.normalizedInputUrlCache.size > NORMALIZED_INPUT_URL_CACHE_MAX_SIZE) {
+      const oldest = this.normalizedInputUrlCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.normalizedInputUrlCache.delete(oldest);
+    }
+  }
+
+  _pruneExpiredNormalizedInputUrlCacheEntries(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.normalizedInputUrlCache.entries()) {
+      if (entry.expiresAtMs <= now) {
+        this.normalizedInputUrlCache.delete(key);
+      }
+    }
+  }
+
+  get currentTrack(): Track | null {
+    return this.queue.current;
+  }
+
+  get displayTrack(): Track | null {
+    if (this.currentTrack) return this.currentTrack;
+    const recentEnough = this.lastKnownTrackAtMs > 0 && (Date.now() - this.lastKnownTrackAtMs) <= 30_000;
+    if (this.voice?.isStreaming && this.lastKnownTrack && recentEnough) {
+      return this.lastKnownTrack;
+    }
+    return null;
+  }
+
+  get pendingTracks(): Track[] {
+    return [...this.queue.tracks];
+  }
+
+  get historyTracks(): Track[] {
+    return [...this.trackHistory];
+  }
+
+  async enqueue(query: string, options: EnqueueOptions = {}): Promise<Track[]> {
+    const requestedBy = options.requestedBy ?? null;
+    const playNext = Boolean(options.playNext);
+    const dedupe = Boolean(options.dedupe);
+
+    const tracks = await this._resolveTracks(query, requestedBy);
+    if (!tracks.length) return [];
+
+    return this.enqueueResolvedTracks(tracks, { dedupe, playNext });
+  }
+
+  enqueueResolvedTracks(tracks: Track[], options: EnqueueOptions = {}): Track[] {
+    const playNext = Boolean(options.playNext);
+    const dedupe = Boolean(options.dedupe);
+    const queueGuard = options.queueGuard && typeof options.queueGuard === 'object'
+      ? options.queueGuard
+      : null;
+    const input = Array.isArray(tracks) ? tracks : [];
+    if (!input.length) return [];
+
+    const dedupedTracks = dedupe
+      ? input.filter((track) => !this._hasDuplicateTrack(track))
+      : input;
+
+    const filteredTracks = dedupedTracks.filter((track) => !this._exceedsMaxTrackLength(track));
+    const tooLongCount = dedupedTracks.length - filteredTracks.length;
+
+    if (!filteredTracks.length) {
+      if (tooLongCount > 0) {
+        throw new ValidationError(this._formatMaxTrackLengthMessage(dedupedTracks));
+      }
+      return [];
+    }
+
+    if (queueGuard?.enabled) {
+      this._enforceQueueGuard(filteredTracks, queueGuard);
+    }
+
+    if (this.queue.pendingSize + filteredTracks.length > this.maxQueueSize) {
+      throw new ValidationError(`Queue limit exceeded (${this.maxQueueSize} pending tracks max).`);
+    }
+
+    if (playNext) {
+      for (let i = filteredTracks.length - 1; i >= 0; i -= 1) {
+        this.queue.addFront(filteredTracks[i]!);
+      }
+    } else {
+      for (const track of filteredTracks) {
+        this.queue.add(track);
+      }
+    }
+
+    this.emit('tracksAdded', filteredTracks);
+    return filteredTracks;
+  }
+
+  _exceedsMaxTrackLength(track: Track): boolean {
+    if (this.maxTrackLengthMs <= 0) return false;
+    if (track?.isLive || track?.nodelinkInfo?.isStream) return false;
+
+    const lengthMs = Number(track?.nodelinkInfo?.length ?? 0);
+    if (!Number.isFinite(lengthMs) || lengthMs <= 0) return false;
+
+    return lengthMs > this.maxTrackLengthMs;
+  }
+
+  _formatMaxTrackLengthMessage(tracks: Track[]): string {
+    const limitHours = Math.round(this.maxTrackLengthMs / 3_600_000);
+    const longest = tracks.reduce((max, track) => {
+      const ms = Number(track?.nodelinkInfo?.length ?? 0);
+      return Number.isFinite(ms) && ms > max ? ms : max;
+    }, 0);
+
+    if (longest <= 0) {
+      return `Track is too long (maximum ${limitHours} hours).`;
+    }
+
+    const hours = Math.floor(longest / 3_600_000);
+    const minutes = Math.floor((longest % 3_600_000) / 60_000);
+    return `Track is too long (${hours}h ${minutes}m). The maximum is ${limitHours} hours.`;
+  }
+
+  _enforceQueueGuard(newTracks: Track[], guard: QueueGuardOption): void {
+    const pending = this.pendingTracks;
+    const windowSize = Math.max(1, Math.min(200, Number.parseInt(String(guard.windowSize ?? 25), 10) || 25));
+    const maxPerRequesterWindow = Math.max(1, Math.min(50, Number.parseInt(String(guard.maxPerRequesterWindow ?? 5), 10) || 5));
+    const maxArtistStreak = Math.max(1, Math.min(20, Number.parseInt(String(guard.maxArtistStreak ?? 3), 10) || 3));
+
+    const queueWindow = pending.slice(-windowSize);
+    const requesterCounts = new Map();
+    for (const track of queueWindow) {
+      const requester = String(track?.requestedBy ?? '').trim();
+      if (!requester) continue;
+      requesterCounts.set(requester, (requesterCounts.get(requester) ?? 0) + 1);
+    }
+
+    for (const track of newTracks) {
+      const requester = String(track?.requestedBy ?? '').trim();
+      if (!requester) continue;
+      const nextCount = (requesterCounts.get(requester) ?? 0) + 1;
+      if (nextCount > maxPerRequesterWindow) {
+        throw new ValidationError(
+          `Queue guard: requester limit reached (${maxPerRequesterWindow} tracks per ${windowSize} queue items).`
+        );
+      }
+      requesterCounts.set(requester, nextCount);
+    }
+
+    const artistQueue = [...pending, ...newTracks].map((track) => this._trackArtistKey(track)).filter(Boolean);
+    let streak = 1;
+    for (let i = 1; i < artistQueue.length; i += 1) {
+      if (artistQueue[i] === artistQueue[i - 1]) {
+        streak += 1;
+      } else {
+        streak = 1;
+      }
+      if (streak > maxArtistStreak) {
+        throw new ValidationError(
+          `Queue guard: max artist streak exceeded (${maxArtistStreak}). Mix in a different artist.`
+        );
+      }
+    }
+  }
+
+  _trackArtistKey(track: Partial<Track> | null | undefined): string | null {
+    const explicit = String(track?.artist ?? '').trim().toLowerCase();
+    if (explicit) return explicit;
+
+    const title = String(track?.title ?? '').trim().toLowerCase();
+    if (!title) return null;
+    if (title.includes(' - ')) {
+      return (title.split(' - ')[0] ?? '').trim() || null;
+    }
+    return title.split(' ').slice(0, 2).join(' ').trim();
+  }
+
+  async play(): Promise<void> {
+    if (this.playing) return;
+
+    this._cleanupProcesses();
+    const startupHint = this.nextPlaybackStartupHint;
+    this.nextPlaybackStartupHint = null;
+
+    let track = this.queue.next();
+    if (!track) {
+      this._stopVoiceStream();
+      this.emit('queueEmpty');
+      return;
+    }
+    const playbackToken = ++this.activePlaybackToken;
+    const startupToken = this._beginPlaybackStartup();
+
+    this.playing = true;
+    this.paused = false;
+    this.skipRequested = false;
+    let ffmpegStartupStderr = '';
+    let onFfmpegStartupStderr = null;
+    let ffmpegProc = null;
+    let initialPlaybackChunkTimeoutMs: number | null = null;
+    let retryStartupTrack: Track | null = null;
+    this.activeSourceProcessCloseInfo = null;
+
+    try {
+      this._ensurePlaybackStartupActive(startupToken);
+      this.streamAppliedVolumePercent = 100;
+      let trackUrl = String(track.url ?? '').trim();
+      if (!trackUrl) {
+        throw new ValidationError('Track is missing a playable URL.');
+      }
+
+      if (!track.nodelinkEncodedTrack && this._isNodeLinkOnlyModeForSourceTrack(track, trackUrl)) {
+        const resolved = await this._resolveTrackViaNodeLink(track).catch((err: unknown) => {
+          this.logger?.debug?.('NodeLink re-resolution of a stored track failed', {
+            title: track.title,
+            url: trackUrl,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        });
+        this._ensurePlaybackStartupActive(startupToken);
+        if (resolved?.nodelinkEncodedTrack) {
+          track.nodelinkEncodedTrack = resolved.nodelinkEncodedTrack;
+          track.nodelinkInfo = resolved.nodelinkInfo ?? null;
+        }
+      }
+
+      if (track.nodelinkEncodedTrack) {
+        await this._startNodeLinkStream(track, startupToken, playbackToken);
+        return;
+      }
+
+      if (this._isNodeLinkOnlyModeForSourceTrack(track, trackUrl)) {
+        throw new ValidationError('NodeLink could not provide a playable stream for this track.');
+      }
+
+      // Only plain HTTP audio and internet radio are decoded locally (ffmpeg); never provider pages.
+      if (!isHttpUrl(trackUrl) || isYouTubeUrl(trackUrl)) {
+        throw new ValidationError('Track source is not supported without NodeLink.');
+      }
+      if (track?.isLive || String(track.source ?? '').startsWith('radio')) {
+        await this._startHttpUrlPipeline(trackUrl, 0, { isLive: true });
+      } else {
+        await this._startHttpUrlPipeline(trackUrl, track.seekStartSec ?? 0, { isLive: false });
+      }
+      this._ensurePlaybackStartupActive(startupToken);
+
+      ffmpegProc = this.ffmpeg;
+      if (!ffmpegProc?.stdout?.pipe || !ffmpegProc?.once) {
+        throw new Error('Playback pipeline did not initialize ffmpeg output.');
+      }
+
+      ffmpegProc.stderr?.setEncoding?.('utf8');
+      onFfmpegStartupStderr = (chunk: unknown) => {
+        ffmpegStartupStderr = `${ffmpegStartupStderr}${String(chunk ?? '')}`.slice(-4096);
+      };
+      ffmpegProc.stderr?.on?.('data', onFfmpegStartupStderr);
+
+      let playbackStarted = false;
+      ffmpegProc.once?.('close', async (code: unknown, signal: unknown) => {
+        if (!playbackStarted) return;
+        await this._drainPlaybackBeforeClose();
+        await this._handleTrackClose(track, code, signal, playbackToken);
+      });
+
+      const playbackOutput = this._createPlaybackOutputStream();
+      this.playbackSourceStream = ffmpegProc.stdout ?? null;
+      if (this._shouldUseLiveAudioProcessor()) {
+        this.liveAudioProcessor = this._createLiveAudioProcessor();
+        this._bindPipelineErrorHandler(this.liveAudioProcessor, 'liveAudioProcessor');
+        ffmpegProc.stdout?.pipe?.(this.liveAudioProcessor);
+        this.liveAudioProcessor.pipe(playbackOutput);
+      } else {
+        ffmpegProc.stdout?.pipe?.(playbackOutput);
+      }
+
+      await this.voice.sendAudio?.(playbackOutput);
+      this._ensurePlaybackStartupActive(startupToken);
+      initialPlaybackChunkTimeoutMs = this._getInitialPlaybackChunkTimeoutMs(track, { hint: startupHint });
+      await this._awaitInitialPlaybackChunk(
+        playbackOutput,
+        ffmpegProc,
+        initialPlaybackChunkTimeoutMs
+      );
+      this._ensurePlaybackStartupActive(startupToken);
+      playbackStarted = true;
+      this.consecutiveStartupFailures = 0;
+      this.activeSourceProcessCloseInfo = null;
+      this._startPlaybackClock(track.seekStartSec ?? 0);
+      this.lastKnownTrack = track;
+      this.lastKnownTrackAtMs = Date.now();
+      this._noteMirrorSourceSuccess(track?.source);
+      this.emit('trackStart', track);
+      this.logger?.info?.('Playback started', {
+        title: track.title,
+        url: track.url,
+        seek: track.seekStartSec ?? 0,
+        guildId: String((this.voice as { guildId?: unknown } | null | undefined)?.guildId ?? '').trim() || null,
+        channelId: String((this.voice as { channelId?: unknown } | null | undefined)?.channelId ?? '').trim() || null,
+      });
+    } catch (err) {
+      const startupAborted = this._isPlaybackStartupAbortedError(err) || startupToken !== this.playbackStartupToken;
+      let normalizedMessage = '';
+      if (!startupAborted) {
+        const normalized = this._normalizePlaybackError(this._withStartupStderr(err, ffmpegStartupStderr));
+        normalizedMessage = String(normalized?.message ?? '').toLowerCase();
+        const startupRetryAttempt = getStartupRetryAttempt(track);
+        const nodeLinkOnlyTrack = this._isNodeLinkOnlyModeForSourceTrack(track, track?.url ?? null);
+        const shouldRetryNodeLink = (
+          nodeLinkOnlyTrack
+          && startupRetryAttempt < 1
+          && !normalizedMessage.includes('not connected')
+        );
+        if (shouldRetryNodeLink) {
+          const nodeLinkRetryTrack = await this._resolveTrackViaNodeLink(
+            this._cloneTrack(track, { seekStartSec: track?.seekStartSec ?? 0 }),
+          ).catch(() => null);
+          if (nodeLinkRetryTrack?.nodelinkEncodedTrack) {
+            retryStartupTrack = this._cloneTrack(nodeLinkRetryTrack, {
+              seekStartSec: track?.seekStartSec ?? 0,
+            });
+            (retryStartupTrack as Track & { startupRetryCount?: number }).startupRetryCount = startupRetryAttempt + 1;
+          }
+        }
+        const mirrorSourceLabel = String(track?.source ?? '').toLowerCase();
+        const previousMirrorSources = Array.isArray(
+          (track as Track & { exhaustedMirrorSources?: string[] })?.exhaustedMirrorSources,
+        )
+          ? (track as Track & { exhaustedMirrorSources?: string[] }).exhaustedMirrorSources!
+          : [];
+        const exhaustedMirrorSources = [...previousMirrorSources];
+        if (mirrorSourceLabel) {
+          exhaustedMirrorSources.push(mirrorSourceLabel);
+          this._noteMirrorSourceFailure(mirrorSourceLabel);
+        }
+
+        const shouldMirrorStartup = (
+          !retryStartupTrack
+          && shouldMirrorFailedStartup({
+            url: track?.url ?? null,
+            source: track?.source ?? null,
+            isLive: track?.isLive ?? false,
+            previousMirrorSources,
+            nodeLinkOnly: nodeLinkOnlyTrack,
+          })
+          && !normalizedMessage.includes('not connected')
+          && startupRetryAttempt < Math.min(
+            MIRROR_ATTEMPT_CEILING,
+            Math.max(2, (this.nodeLinkMirrorSearchOrder?.length ?? 0) + 1),
+          )
+        );
+        if (shouldMirrorStartup) {
+          const requestedBy = String(track?.requestedBy ?? '').trim() || null;
+          const mirrorTrack = await this._resolveStartupMirrorFallbackTrack(
+            track,
+            requestedBy,
+            exhaustedMirrorSources,
+          ).catch(() => null);
+          if (mirrorTrack) {
+            retryStartupTrack = this._cloneTrack(mirrorTrack, { seekStartSec: track?.seekStartSec ?? 0 });
+            const typedRetry = retryStartupTrack as Track & {
+              startupRetryCount?: number;
+              exhaustedMirrorSources?: string[];
+            };
+            typedRetry.startupRetryCount = startupRetryAttempt + 1;
+            typedRetry.exhaustedMirrorSources = exhaustedMirrorSources;
+            this.logger?.warn?.('Resolved playback mirror after source stream failure', {
+              title: track?.title ?? null,
+              source: track?.source ?? null,
+              mirrorSource: retryStartupTrack.source ?? null,
+              mirrorUrl: retryStartupTrack.url ?? null,
+              attempt: startupRetryAttempt + 1,
+              exhausted: exhaustedMirrorSources,
+            });
+          }
+        }
+        const setupFailureLogPayload = {
+          track: track.title,
+          url: track?.url ?? null,
+          source: track?.source ?? null,
+          seek: track?.seekStartSec ?? 0,
+          startupHint: startupHint ?? null,
+          initialPlaybackChunkTimeoutMs: typeof initialPlaybackChunkTimeoutMs === 'number'
+            ? initialPlaybackChunkTimeoutMs
+            : null,
+          error: normalized.message,
+        };
+        if (retryStartupTrack) {
+          this.logger?.warn?.('Playback setup failed before audio output; retrying startup', setupFailureLogPayload);
+        } else {
+          this.emit('trackError', { track, error: normalized });
+          this.logger?.error?.('Playback setup failed', setupFailureLogPayload);
+        }
+        const isStartupFloodCandidate = (
+          normalizedMessage.includes('did not produce audio output in time')
+          || normalizedMessage.includes('before audio output')
+        );
+        if (isStartupFloodCandidate) {
+          const playerDiagnostics = typeof this.getDiagnostics === 'function'
+            ? this.getDiagnostics()
+            : null;
+          const voiceDiagnostics = typeof this.voice?.getDiagnostics === 'function'
+            ? await this.voice.getDiagnostics().catch(() => null)
+            : {
+                connected: Boolean(this.voice?.connected),
+                isStreaming: Boolean(this.voice?.isStreaming),
+                channelId: (this.voice as { channelId?: unknown } | null | undefined)?.channelId ?? null,
+              };
+          this.logger?.debug?.('Playback startup diagnostics snapshot', {
+            track: track.title,
+            url: track?.url ?? null,
+            source: track?.source ?? null,
+            seek: track?.seekStartSec ?? 0,
+            startupHint: startupHint ?? null,
+            initialPlaybackChunkTimeoutMs,
+            player: playerDiagnostics,
+            voice: voiceDiagnostics,
+          });
+        }
+        this.consecutiveStartupFailures = retryStartupTrack
+          ? 0
+          : isStartupFloodCandidate
+          ? this.consecutiveStartupFailures + 1
+          : 0;
+        if (retryStartupTrack) {
+          this.logger?.warn?.('Retrying startup after pre-audio pipeline failure', {
+            title: track?.title ?? null,
+            url: track?.url ?? null,
+            source: track?.source ?? null,
+            seek: track?.seekStartSec ?? 0,
+            retryAttempt: (retryStartupTrack as Track & { startupRetryCount?: number }).startupRetryCount ?? 1,
+            previousStartupHint: startupHint ?? null,
+            previousInitialPlaybackChunkTimeoutMs: initialPlaybackChunkTimeoutMs,
+          });
+        }
+      } else {
+        this.logger?.debug?.('Playback startup aborted before first audio chunk', {
+          title: track?.title ?? null,
+          url: track?.url ?? null,
+        });
+      }
+
+      const pendingSeekTrack = this.pendingSeekTrack;
+      this.pendingSeekTrack = null;
+
+      this._cleanupProcesses();
+      this.playing = false;
+      this.paused = false;
+      this._resetPlaybackClock();
+      this.queue.current = null;
+
+      if (startupAborted && pendingSeekTrack) {
+        this.queue.addFront(pendingSeekTrack);
+      }
+
+      if (retryStartupTrack) {
+        this.queue.addFront(retryStartupTrack);
+      }
+
+      if (
+        !startupAborted
+        && !retryStartupTrack
+        && normalizedMessage.includes('not connected')
+        && !this.voice?.connected
+      ) {
+        this.queue.addFront(track);
+        this._stopVoiceStream();
+        this.consecutiveStartupFailures = 0;
+        this.logger?.warn?.('Voice not connected, pausing queue until reconnect', {
+          guildId: String((this.voice as { guildId?: unknown } | null | undefined)?.guildId ?? '').trim() || null,
+          track: track?.title ?? null,
+          pendingTracks: this.queue.pendingSize,
+        });
+        this.emit('playbackPaused', {
+          reason: 'voice_disconnected',
+          track: track?.title ?? null,
+          pendingTracks: this.queue.pendingSize,
+        });
+        return;
+      }
+
+      if (
+        !startupAborted
+        && this.queue.pendingSize > 0
+        && this.consecutiveStartupFailures >= STARTUP_FAILURE_STREAK_LIMIT
+      ) {
+        const droppedTracks = this.clearQueue();
+        this._stopVoiceStream();
+        this.logger?.warn?.('Halting queue after repeated playback startup failures', {
+          failedTrack: track?.title ?? null,
+          consecutiveStartupFailures: this.consecutiveStartupFailures,
+          droppedTracks,
+        });
+        this.emit('queueEmpty', {
+          reason: 'startup_error_limit',
+          consecutiveStartupFailures: this.consecutiveStartupFailures,
+          droppedTracks,
+        });
+        return;
+      }
+
+      if (this.queue.pendingSize > 0) {
+        await this.play();
+        return;
+      }
+
+      this._stopVoiceStream();
+      if (!startupAborted) {
+        this.emit('queueEmpty', { reason: 'startup_error' });
+        return;
+      }
+
+      if (this.skipRequested || pendingSeekTrack) {
+        this.emit('queueEmpty');
+      }
+    } finally {
+      if (onFfmpegStartupStderr) {
+        ffmpegProc?.stderr?.off?.('data', onFfmpegStartupStderr);
+      }
+    }
+  }
+
+  _cleanupProcesses() {
+    cleanupProcesses(this);
+  }
+
+  _beginPlaybackStartup(): number {
+    this.playbackStartupToken += 1;
+    return this.playbackStartupToken;
+  }
+
+  _invalidatePlaybackStartup(): void {
+    this.playbackStartupToken += 1;
+  }
+
+  _ensurePlaybackStartupActive(token: number): void {
+    if (token !== this.playbackStartupToken) {
+      throw new PlaybackStartupAbortedError();
+    }
+  }
+
+  _isPlaybackStartupAbortedError(err: unknown): boolean {
+    return err instanceof PlaybackStartupAbortedError;
+  }
+
+  _withStartupStderr(err: unknown, stderrText = ''): unknown {
+    if (!(err instanceof Error)) return err;
+    const trimmed = String(stderrText ?? '').trim();
+    if (!trimmed) return err;
+    if (!String(err.message ?? '').includes('Playback pipeline exited before audio output')) {
+      return err;
+    }
+
+    const tail = trimmed
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(-2)
+      .join(' | ');
+    if (!tail) return err;
+    return new Error(`${err.message} ${tail}`);
+  }
+
+  _noteMirrorSourceFailure(source: unknown): void {
+    const key = String(source ?? '').trim().toLowerCase();
+    if (!key) return;
+    const entry = this.mirrorSourceCooldowns.get(key) ?? { failures: 0, until: 0 };
+    entry.failures += 1;
+    if (entry.failures >= MIRROR_SOURCE_COOLDOWN_FAILURES) {
+      entry.until = Date.now() + MIRROR_SOURCE_COOLDOWN_MS;
+      entry.failures = 0;
+      this.logger?.warn?.('Pausing mirror source after repeated stream failures', {
+        source: key,
+        cooldownMs: MIRROR_SOURCE_COOLDOWN_MS,
+      });
+    }
+    this.mirrorSourceCooldowns.set(key, entry);
+  }
+
+  _noteMirrorSourceSuccess(source: unknown): void {
+    const key = String(source ?? '').trim().toLowerCase();
+    if (!key) return;
+    this.mirrorSourceCooldowns.delete(key);
+  }
+
+  _isMirrorSourceCooling(source: unknown): boolean {
+    const key = String(source ?? '').trim().toLowerCase();
+    if (!key) return false;
+    const entry = this.mirrorSourceCooldowns.get(key);
+    if (!entry?.until) return false;
+    if (entry.until > Date.now()) return true;
+    this.mirrorSourceCooldowns.delete(key);
+    return false;
+  }
+
+  _stopVoiceStream() {
+    stopVoiceStream(this);
+  }
+
+  _bindPipelineErrorHandler(stream: unknown, label: string) {
+    bindPipelineErrorHandler(this, stream, label);
+  }
+
+  async _startNodeLinkStream(track: Track, startupToken: number, playbackToken: number): Promise<void> {
+    if (!this.nodeLinkClient.enabled) {
+      throw new ValidationError('NodeLink is not configured.');
+    }
+
+    const positionMs = Math.max(0, Number.parseInt(String(track.seekStartSec ?? 0), 10) || 0) * 1000;
+    const guildId = String((this.voice as { guildId?: unknown } | null | undefined)?.guildId ?? '').trim() || null;
+    const delegatedVolume = this._canDelegateVolumeToStream() ? this.volumePercent : 100;
+    const nodeLinkStream = await this.nodeLinkClient.streamTrack(track, {
+      positionMs,
+      volume: delegatedVolume,
+      ...(guildId ? { guildId } : {}),
+    });
+    this.streamAppliedVolumePercent = delegatedVolume;
+    this.sourceStream = nodeLinkStream as PipelineStreamLike;
+    this.receivedPcmBytes = 0;
+    this._bindPipelineErrorHandler(nodeLinkStream, 'nodelink.stream');
+
+    let playbackStarted = false;
+    let closeHandled = false;
+    let lastChunkAtMs = Date.now();
+    nodeLinkStream.on('data', (chunk: Buffer) => {
+      if (this.sourceStream !== nodeLinkStream) return;
+      this.receivedPcmBytes = (this.receivedPcmBytes ?? 0) + chunk.length;
+      lastChunkAtMs = Date.now();
+    });
+
+    const stallWatchdog = setInterval(() => {
+      if (closeHandled || nodeLinkStream.destroyed) {
+        clearInterval(stallWatchdog);
+        return;
+      }
+      if (!playbackStarted) return;
+      if (this.paused || !this.voice?.connected) {
+        lastChunkAtMs = Date.now();
+        return;
+      }
+      const stalledMs = Date.now() - lastChunkAtMs;
+      if (stalledMs < NODELINK_STALL_TIMEOUT_MS) return;
+
+      clearInterval(stallWatchdog);
+      this.logger?.warn?.('NodeLink stream stalled, restarting from the last received position', {
+        title: track.title,
+        source: track.source,
+        stalledMs,
+        progressSec: typeof this.getProgressSeconds === 'function' ? this.getProgressSeconds() : null,
+        receivedPcmBytes: this.receivedPcmBytes,
+        guildId,
+      });
+      nodeLinkStream.destroy(new Error('NodeLink stream stalled'));
+    }, NODELINK_STALL_CHECK_INTERVAL_MS);
+    stallWatchdog.unref?.();
+
+    const onClose = async () => {
+      clearInterval(stallWatchdog);
+      if (!playbackStarted || closeHandled) return;
+      closeHandled = true;
+      await this._drainPlaybackBeforeClose();
+      await this._handleTrackClose(track, 0, null, playbackToken);
+    };
+    nodeLinkStream.once('end', onClose);
+    nodeLinkStream.once('close', onClose);
+
+    const playbackOutput = this._createPlaybackOutputStream();
+    this.playbackSourceStream = nodeLinkStream as PipelineStreamLike;
+    if (this._shouldUseLiveAudioProcessor()) {
+      this.liveAudioProcessor = this._createLiveAudioProcessor();
+      this._bindPipelineErrorHandler(this.liveAudioProcessor, 'liveAudioProcessor');
+      nodeLinkStream.pipe(this.liveAudioProcessor);
+      this.liveAudioProcessor.pipe(playbackOutput);
+    } else {
+      nodeLinkStream.pipe(playbackOutput);
+    }
+
+    await this.voice.sendAudio?.(playbackOutput);
+    this._ensurePlaybackStartupActive(startupToken);
+    const timeoutMs = this._getInitialPlaybackChunkTimeoutMs(track, { hint: 'nodelink' });
+    await this._awaitInitialPlaybackChunk(playbackOutput, nodeLinkStream as unknown as PipelineProcess, timeoutMs);
+    this._ensurePlaybackStartupActive(startupToken);
+    playbackStarted = true;
+    this.consecutiveStartupFailures = 0;
+    this.activeSourceProcessCloseInfo = null;
+    this._startPlaybackClock(track.seekStartSec ?? 0);
+    this.lastKnownTrack = track;
+    this.lastKnownTrackAtMs = Date.now();
+    this._noteMirrorSourceSuccess(track?.source);
+    this.emit('trackStart', track);
+    this.logger?.info?.('Playback started', {
+      title: track.title,
+      url: track.url,
+      source: track.source,
+      backend: 'nodelink',
+      seek: track.seekStartSec ?? 0,
+      guildId,
+      channelId: String((this.voice as { channelId?: unknown } | null | undefined)?.channelId ?? '').trim() || null,
+    });
+  }
+
+  _startPlaybackClock(offsetSec: number) {
+    startPlaybackClock(this, offsetSec);
+  }
+
+  _resetPlaybackClock() {
+    resetPlaybackClock(this);
+  }
+
+  _normalizePlaybackError(err: unknown) {
+    return normalizePlaybackError(this, err);
+  }
+}
+
+export interface MusicPlayer
+  extends PlaybackStateMethods,
+    PipelineMethodMembers,
+    ResolverMethodMembers,
+    UrlResolverMethods,
+    QueueLifecycleMethods,
+    NodeLinkMethods,
+    TrackRuntimeMethods,
+    TrackFactoryMethods {}
+
+Object.assign(
+  MusicPlayer.prototype,
+  playbackStateMethods,
+  queueLifecycleMethods,
+  resolverMethods,
+  nodeLinkMethods,
+  trackRuntimeMethods,
+  pipelineMethods,
+  sourceMethods
+);
+
+
+
+

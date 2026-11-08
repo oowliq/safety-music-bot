@@ -1,0 +1,514 @@
+import { ValidationError } from '../../core/errors.ts';
+import { LOOP_QUEUE, LOOP_TRACK } from './constants.ts';
+import { isHttpUrl, isYouTubeUrl } from './trackUtils.ts';
+import type { MusicPlayer } from '../MusicPlayer.ts';
+import type { Track } from '../../types/domain.ts';
+
+const EARLY_CLOSE_MIN_REMAINING_SEC = 10;
+const RECOVERY_WINDOW_MS = 10 * 60_000;
+const PCM_BYTES_PER_SECOND = 48_000 * 2 * 2;
+const LIVE_RESTART_MAX_ATTEMPTS = 5;
+const LIVE_RESTART_BASE_DELAY_MS = 1_000;
+const LIVE_RESTART_MAX_DELAY_MS = 15_000;
+
+function isLiveStreamTrack(track: Track | null | undefined) {
+  return track?.isLive === true || String(track?.source ?? '').startsWith('radio');
+}
+
+function summarizeStderrTail(tail: string | null | undefined) {
+  const lines = String(tail ?? '')
+    .split(/[\r\n]+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  return lines.length ? lines.slice(-4).join(' | ') : null;
+}
+
+type RecoverableTrack = Track & {
+  recoveryAttemptCount?: unknown;
+  recoveryWindowStartedAtMs?: unknown;
+};
+
+export type QueueLifecycleMethods = {
+  clearQueue(): number;
+  shuffleQueue(): number;
+  removeFromQueue(index: number): unknown;
+  removeRangeFromQueue(fromIndex: number, toIndex: number): Track[];
+  skipToQueueIndex(index: number): Track | null;
+  moveQueueItem(fromIndex: number, toIndex: number): boolean;
+  getLastHistoryTrack(): Track | null;
+  replayCurrentTrack(): boolean;
+  refreshCurrentTrackProcessing(): boolean;
+  getTotalPendingDurationSeconds(): number;
+  queuePreviousTrack(): Track | null;
+  canSeekCurrentTrack(): boolean;
+  seekTo(seconds: unknown): number;
+  pause(): boolean;
+  resume(): boolean;
+  _setPipelinePaused(paused: unknown): boolean;
+  skip(): boolean;
+  stop(): void;
+  _handleTrackClose(track: Track, code: unknown, signal: unknown, playbackToken?: number | null): Promise<void>;
+};
+type QueueLifecycleRuntime = MusicPlayer & QueueLifecycleMethods & {
+  getProgressSeconds(): number;
+  nextPlaybackStartupHint: string | null;
+};
+
+function triggerImmediateTrackTransition(player: QueueLifecycleRuntime) {
+  const track = player.currentTrack;
+  const hasStartedPlayback = player.trackStartedAtMs != null;
+  if (!track || !hasStartedPlayback) return;
+
+  const transitionToken = ++player.activePlaybackToken;
+  void player._handleTrackClose(track, 'skip', null, transitionToken).catch((err: unknown) => {
+    player.logger?.warn?.('Immediate skip transition failed', {
+      title: track?.title ?? null,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+}
+
+function getTrackRecoveryState(track: Track | null | undefined, nowMs: number) {
+  const recoverable = track as RecoverableTrack | null | undefined;
+  const parsedAttempt = Number.parseInt(String(recoverable?.recoveryAttemptCount ?? 0), 10);
+  const attempt = Number.isFinite(parsedAttempt) && parsedAttempt > 0 ? parsedAttempt : 0;
+  const windowStartedAtMs = Number(recoverable?.recoveryWindowStartedAtMs);
+  const hasWindow = Number.isFinite(windowStartedAtMs) && windowStartedAtMs > 0;
+
+  if (hasWindow && nowMs - windowStartedAtMs >= RECOVERY_WINDOW_MS) {
+    return { attempt: 0, windowStartedAtMs: nowMs };
+  }
+  return { attempt, windowStartedAtMs: hasWindow ? windowStartedAtMs : nowMs };
+}
+
+function getReceivedAudioSeconds(player: QueueLifecycleRuntime): number | null {
+  const bytes = player.receivedPcmBytes;
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return null;
+  return Math.floor(Math.max(0, player.currentTrackOffsetSec) + bytes / PCM_BYTES_PER_SECOND);
+}
+
+export const queueLifecycleMethods: QueueLifecycleMethods & ThisType<QueueLifecycleRuntime> = {
+  clearQueue(this: QueueLifecycleRuntime) {
+    const removed = this.queue.pendingSize;
+    this.queue.tracks = [];
+    return removed;
+  },
+
+  shuffleQueue(this: QueueLifecycleRuntime) {
+    this.queue.shuffle();
+    return this.queue.pendingSize;
+  },
+
+  removeFromQueue(this: QueueLifecycleRuntime, index) {
+    const removed = this.queue.remove(index);
+    return removed;
+  },
+
+  removeRangeFromQueue(this: QueueLifecycleRuntime, fromIndex, toIndex) {
+    const removed = this.queue.removeRange(fromIndex, toIndex);
+    return removed;
+  },
+
+  skipToQueueIndex(this: QueueLifecycleRuntime, index) {
+    if (!this.playing) return null;
+    if (!Number.isInteger(index) || index < 1 || index > this.queue.pendingSize) return null;
+    this.queue.dropBefore(index);
+    const target = this.queue.tracks[0] ?? null;
+    this.skip();
+    return target;
+  },
+
+  moveQueueItem(this: QueueLifecycleRuntime, fromIndex, toIndex) {
+    const moved = this.queue.move(fromIndex, toIndex);
+    return moved;
+  },
+
+  getLastHistoryTrack(this: QueueLifecycleRuntime) {
+    if (!this.trackHistory.length) return null;
+    return this.trackHistory[this.trackHistory.length - 1] ?? null;
+  },
+
+  replayCurrentTrack(this: QueueLifecycleRuntime) {
+    if (!this.currentTrack || !this.playing) return false;
+    this.pendingSeekTrack = this._cloneTrack(this.currentTrack, { seekStartSec: 0 });
+    this._invalidatePlaybackStartup();
+    this.skipRequested = true;
+    this._stopVoiceStream();
+    this._cleanupProcesses();
+    triggerImmediateTrackTransition(this);
+    return true;
+  },
+
+  refreshCurrentTrackProcessing(this: QueueLifecycleRuntime) {
+    if (!this.playing || !this.currentTrack) return false;
+    const seekStartSec = this.canSeekCurrentTrack()
+      ? this.getProgressSeconds()
+      : 0;
+    this.pendingSeekTrack = this._cloneTrack(this.currentTrack, { seekStartSec });
+    this._invalidatePlaybackStartup();
+    this.skipRequested = true;
+    this._stopVoiceStream();
+    this._cleanupProcesses();
+    triggerImmediateTrackTransition(this);
+    return true;
+  },
+
+  getTotalPendingDurationSeconds(this: QueueLifecycleRuntime) {
+    let total = 0;
+    for (const track of this.pendingTracks) {
+      const parsed = this._parseDurationSeconds(track.duration);
+      if (parsed == null) continue;
+      total += parsed;
+    }
+    return total;
+  },
+
+  queuePreviousTrack(this: QueueLifecycleRuntime) {
+    const previous = this.getLastHistoryTrack();
+    if (!previous) return null;
+
+    const clone = this._cloneTrack(previous);
+    this.queue.addFront(clone);
+    this.emit('tracksAdded', [clone]);
+    return clone;
+  },
+
+  canSeekCurrentTrack(this: QueueLifecycleRuntime) {
+    if (!this.currentTrack) return false;
+    if (this.currentTrack.isLive) return false;
+    if (this.currentTrack.nodelinkEncodedTrack) {
+      return this.currentTrack.nodelinkInfo?.isSeekable !== false;
+    }
+    const source = String(this.currentTrack.source ?? '').trim().toLowerCase();
+    if (String(this.currentTrack.deezerTrackId ?? '').trim() || source.startsWith('deezer')) return true;
+    if (String(this.currentTrack.soundcloudTrackId ?? '').trim() || source.startsWith('soundcloud')) return true;
+    if (String(this.currentTrack.audiusTrackId ?? '').trim() || source.startsWith('audius')) return true;
+    if (isYouTubeUrl(this.currentTrack.url)) return true;
+    return isHttpUrl(this.currentTrack.url) && (
+      String(this.currentTrack.source ?? '') === 'http-audio'
+      || String(this.currentTrack.source ?? '') === 'url'
+    );
+  },
+
+  seekTo(this: QueueLifecycleRuntime, seconds) {
+    if (!this.playing || !this.currentTrack) {
+      throw new ValidationError('Nothing is currently playing.');
+    }
+
+    if (!this.canSeekCurrentTrack()) {
+      throw new ValidationError('Seek is currently supported for seekable tracks only.');
+    }
+
+    const target = Number.parseInt(String(seconds), 10);
+    if (!Number.isFinite(target) || target < 0) {
+      throw new ValidationError('Seek target must be a non-negative number of seconds.');
+    }
+
+    const currentDurationSec = this._parseDurationSeconds(this.currentTrack.duration);
+    if (currentDurationSec != null && target >= currentDurationSec) {
+      throw new ValidationError(`Seek target exceeds track length (${this.currentTrack.duration}).`);
+    }
+
+    this.pendingSeekTrack = {
+      ...this.currentTrack,
+      seekStartSec: target,
+    };
+
+    this._invalidatePlaybackStartup();
+    this.skipRequested = true;
+    this._stopVoiceStream();
+    this._cleanupProcesses();
+    triggerImmediateTrackTransition(this);
+    return target;
+  },
+
+  pause(this: QueueLifecycleRuntime) {
+    if (!this.playing || this.paused) return false;
+    if (!this._setPipelinePaused(true)) return false;
+
+    this.paused = true;
+    this.pauseStartedAtMs = Date.now();
+    return true;
+  },
+
+  resume(this: QueueLifecycleRuntime) {
+    if (!this.playing || !this.paused) return false;
+    if (!this._setPipelinePaused(false)) return false;
+
+    if (this.pauseStartedAtMs) {
+      this.totalPausedMs += Date.now() - this.pauseStartedAtMs;
+    }
+
+    this.pauseStartedAtMs = null;
+    this.paused = false;
+    return true;
+  },
+
+  _setPipelinePaused(this: QueueLifecycleRuntime, paused) {
+    const shouldPause = Boolean(paused);
+    const signal = shouldPause ? 'SIGSTOP' : 'SIGCONT';
+    const streamMethod = shouldPause ? 'pause' : 'resume';
+    const voiceMethod = shouldPause ? 'pauseAudio' : 'resumeAudio';
+    let changed = false;
+
+    const applyVoicePause = this.voice?.[voiceMethod];
+    if (typeof applyVoicePause === 'function') {
+      try {
+        changed = Boolean(applyVoicePause.call(this.voice)) || changed;
+      } catch {
+      }
+    }
+
+    if (process.platform !== 'win32') {
+      for (const proc of [this.sourceProc, this.ffmpeg]) {
+        if (!proc?.kill) continue;
+        try {
+          proc.kill(signal);
+          changed = true;
+        } catch (err) {
+          this.logger?.debug?.('Process signal pause/resume failed; falling back to stream controls', {
+            signal,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
+    for (const stream of [this.sourceStream, this.sourceProc?.stdout, this.ffmpeg?.stdout]) {
+      const method = (stream as { pause?: () => void; resume?: () => void } | null | undefined)?.[streamMethod];
+      if (typeof method !== 'function') continue;
+      try {
+        method.call(stream);
+        changed = true;
+      } catch {
+      }
+    }
+
+    return changed;
+  },
+
+  skip(this: QueueLifecycleRuntime) {
+    if (!this.playing) return false;
+    this._invalidatePlaybackStartup();
+    this.nextPlaybackStartupHint = 'skip';
+    this.skipRequested = true;
+    this._stopVoiceStream();
+    this._cleanupProcesses();
+    triggerImmediateTrackTransition(this);
+    return true;
+  },
+
+  stop(this: QueueLifecycleRuntime) {
+    this._invalidatePlaybackStartup();
+    this.skipRequested = true;
+    this.consecutiveStartupFailures = 0;
+    this.pendingSeekTrack = null;
+    this.queue.clear();
+    this.nextPlaybackStartupHint = null;
+    this._cleanupProcesses();
+    this._stopVoiceStream();
+    this.playing = false;
+    this.paused = false;
+    this._resetPlaybackClock();
+  },
+
+  async _handleTrackClose(this: QueueLifecycleRuntime, track, code, signal, playbackToken = null) {
+    if (playbackToken != null && playbackToken !== this.activePlaybackToken) {
+      this.logger?.debug?.('Ignoring stale track close event', {
+        title: track?.title ?? null,
+        token: playbackToken,
+        activeToken: this.activePlaybackToken,
+      });
+      return;
+    }
+
+    const wasSkip = this.skipRequested;
+    const pendingSeekTrack = this.pendingSeekTrack;
+    const elapsedSeconds = typeof this.getProgressSeconds === 'function'
+      ? this.getProgressSeconds()
+      : null;
+    const receivedAudioSeconds = getReceivedAudioSeconds(this);
+    const expectedDurationSeconds = this._parseDurationSeconds(track?.duration);
+    const sourceCloseInfo = this.activeSourceProcessCloseInfo;
+    const isYouTubeTrack = String(track?.source ?? '').startsWith('youtube');
+    const isNodeLinkTrack = Boolean(track?.nodelinkEncodedTrack);
+    const endedEarly = (
+      !wasSkip
+      && !pendingSeekTrack
+      && expectedDurationSeconds != null
+      && elapsedSeconds != null
+      && expectedDurationSeconds >= 45
+      && elapsedSeconds >= 5
+      && elapsedSeconds < expectedDurationSeconds - EARLY_CLOSE_MIN_REMAINING_SEC
+    );
+    const sourceEndedUnexpectedly = (
+      !wasSkip
+      && !pendingSeekTrack
+      && sourceCloseInfo
+      && isYouTubeTrack
+      && expectedDurationSeconds != null
+      && elapsedSeconds != null
+      && elapsedSeconds >= 5
+      && elapsedSeconds < Math.max(10, expectedDurationSeconds - 120)
+    );
+    const recoveryState = getTrackRecoveryState(track, Date.now());
+    const recoveryAttempt = recoveryState.attempt;
+    const maxRecoveryAttempts = isNodeLinkTrack ? 2 : 1;
+    let continuationTrack = pendingSeekTrack;
+    let recoverySeekSec: number | null = null;
+    if (
+      !continuationTrack
+      && endedEarly
+      && (isYouTubeTrack || isNodeLinkTrack)
+      && elapsedSeconds != null
+      && recoveryAttempt < maxRecoveryAttempts
+    ) {
+      const resumeFromSec = receivedAudioSeconds != null
+        ? Math.min(elapsedSeconds, receivedAudioSeconds)
+        : elapsedSeconds;
+      recoverySeekSec = Math.max(0, resumeFromSec - 2);
+      const recoveryTrack = this._cloneTrack(track, { seekStartSec: recoverySeekSec }) as RecoverableTrack;
+      recoveryTrack.recoveryAttemptCount = recoveryAttempt + 1;
+      recoveryTrack.recoveryWindowStartedAtMs = recoveryState.windowStartedAtMs;
+      // First early-close retry keeps the NodeLink encoded track; second retry falls back local.
+      if (isNodeLinkTrack && recoveryAttempt >= 1 && !this._isNodeLinkOnlyModeForSourceTrack(track, track.url)) {
+        recoveryTrack.nodelinkEncodedTrack = null;
+        recoveryTrack.nodelinkInfo = null;
+      }
+      continuationTrack = recoveryTrack;
+    }
+
+    const isLiveStream = isLiveStreamTrack(track);
+    const liveStreamEnded = isLiveStream && !wasSkip && !pendingSeekTrack;
+    const liveStderrTail = isLiveStream ? summarizeStderrTail(this.liveStreamStderrTail) : null;
+    let liveRestartDelayMs: number | null = null;
+    if (!continuationTrack && liveStreamEnded && recoveryAttempt < LIVE_RESTART_MAX_ATTEMPTS) {
+      const restartTrack = this._cloneTrack(track, { seekStartSec: 0 }) as RecoverableTrack;
+      restartTrack.recoveryAttemptCount = recoveryAttempt + 1;
+      restartTrack.recoveryWindowStartedAtMs = recoveryState.windowStartedAtMs;
+      continuationTrack = restartTrack;
+      liveRestartDelayMs = Math.min(LIVE_RESTART_MAX_DELAY_MS, LIVE_RESTART_BASE_DELAY_MS * 2 ** recoveryAttempt);
+    }
+    const autoRecoveryScheduled = (
+      continuationTrack != null
+      && continuationTrack !== pendingSeekTrack
+      && liveRestartDelayMs == null
+    );
+    this.pendingSeekTrack = null;
+
+    this._cleanupProcesses();
+    this.playing = false;
+    this.paused = false;
+    this._resetPlaybackClock();
+    this.queue.current = null;
+
+    this.emit('trackEnd', {
+      track,
+      code,
+      signal,
+      skipped: wasSkip,
+      seekRestart: Boolean(continuationTrack),
+    });
+
+    if (endedEarly) {
+      this.logger?.warn?.('Track pipeline closed earlier than expected', {
+        title: track?.title ?? null,
+        code: code ?? null,
+        signal: signal ?? null,
+        elapsedSeconds,
+        receivedAudioSeconds,
+        expectedDurationSeconds,
+        source: track?.source ?? null,
+        url: track?.url ?? null,
+        sourceCode: sourceCloseInfo?.code ?? null,
+        sourceSignal: sourceCloseInfo?.signal ?? null,
+        sourceStderrTail: sourceCloseInfo?.stderrTail ?? null,
+        autoRecoveryScheduled,
+        recoveryAttempt,
+        recoverySeekSec,
+      });
+    }
+
+    if (sourceEndedUnexpectedly) {
+      this.logger?.warn?.('Source process ended before expected track duration', {
+        title: track?.title ?? null,
+        url: track?.url ?? null,
+        sourceUrl: sourceCloseInfo.url,
+        elapsedSeconds,
+        expectedDurationSeconds,
+        sourceCode: sourceCloseInfo.code,
+        sourceSignal: sourceCloseInfo.signal,
+        sourceStderrTail: sourceCloseInfo.stderrTail,
+      });
+    }
+
+    if (autoRecoveryScheduled) {
+      const recoveryBackend = isNodeLinkTrack
+        ? (recoveryAttempt >= 1 ? 'nodelink-local-fallback' : 'nodelink-retry')
+        : 'local';
+      this.logger?.warn?.('Scheduling automatic playback recovery after early track close', {
+        title: track?.title ?? null,
+        url: track?.url ?? null,
+        elapsedSeconds,
+        expectedDurationSeconds,
+        recoveryAttempt: recoveryAttempt + 1,
+        recoverySeekSec,
+        recoveryTrigger: sourceCloseInfo ? 'source_close' : 'pipeline_close',
+        backend: recoveryBackend,
+        sourceCode: sourceCloseInfo?.code ?? null,
+        sourceSignal: sourceCloseInfo?.signal ?? null,
+        sourceStderrTail: sourceCloseInfo?.stderrTail ?? null,
+      });
+    }
+
+    if (liveStreamEnded) {
+      const liveMeta = {
+        title: track?.title ?? null,
+        url: track?.url ?? null,
+        code: code ?? null,
+        signal: signal ?? null,
+        elapsedSeconds,
+        restartAttempt: recoveryAttempt + 1,
+        maxAttempts: LIVE_RESTART_MAX_ATTEMPTS,
+        ffmpegStderrTail: liveStderrTail,
+      };
+      if (liveRestartDelayMs != null) {
+        this.logger?.warn?.('Live stream ended, reconnecting', { ...liveMeta, delayMs: liveRestartDelayMs });
+      } else {
+        this.logger?.warn?.('Live stream kept ending, giving up', liveMeta);
+      }
+    }
+
+    if (!continuationTrack) {
+      this._rememberTrack(track);
+    }
+
+    if (continuationTrack) {
+      this.queue.addFront(continuationTrack);
+      if (liveRestartDelayMs != null) {
+        await new Promise((resolve) => setTimeout(resolve, liveRestartDelayMs));
+        if (this.playing || this.queue.tracks[0] !== continuationTrack) return;
+      }
+      await this.play();
+      return;
+    }
+
+    if (!wasSkip) {
+      if (this.loopMode === LOOP_TRACK) {
+        this.queue.addFront(this._cloneTrack(track, { seekStartSec: 0 }));
+      } else if (this.loopMode === LOOP_QUEUE) {
+        this.queue.add(this._cloneTrack(track, { seekStartSec: 0 }));
+      }
+    }
+
+    if (this.queue.pendingSize > 0) {
+      await this.play();
+      return;
+    }
+
+    this.activeSourceProcessCloseInfo = null;
+    this.consecutiveStartupFailures = 0;
+    this._stopVoiceStream();
+    this.emit('queueEmpty');
+  },
+};

@@ -1,0 +1,289 @@
+import { Readable } from 'node:stream';
+import { ValidationError } from '../../core/errors.ts';
+import type { Track } from '../../types/domain.ts';
+import { isNodeLinkSourceIdentifier } from './searchPrefix.ts';
+
+export function describeNodeLinkErrorBody(body: string, fallback: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return fallback;
+  try {
+    const parsed = JSON.parse(trimmed) as { message?: unknown; error?: unknown };
+    const message = typeof parsed?.message === 'string' ? parsed.message.trim() : '';
+    if (message) return message.slice(0, 300);
+    const error = typeof parsed?.error === 'string' ? parsed.error.trim() : '';
+    if (error) return error.slice(0, 300);
+  } catch {
+    return trimmed.slice(0, 300);
+  }
+  return trimmed.slice(0, 300);
+}
+
+export type NodeLinkTrackInfo = Record<string, unknown> & {
+  identifier?: unknown;
+  title?: unknown;
+  author?: unknown;
+  length?: unknown;
+  isSeekable?: unknown;
+  isStream?: unknown;
+  uri?: unknown;
+  artworkUrl?: unknown;
+  sourceName?: unknown;
+  isrc?: unknown;
+};
+
+export type NodeLinkTrackData = {
+  encoded?: unknown;
+  info?: NodeLinkTrackInfo | null;
+  pluginInfo?: Record<string, unknown> | null;
+  userData?: unknown;
+};
+
+export type NodeLinkLoadResult = {
+  loadType?: unknown;
+  data?: unknown;
+  exception?: {
+    message?: unknown;
+    severity?: unknown;
+  } | null;
+};
+
+export type NodeLinkInfo = Record<string, unknown> & {
+  version?: {
+    semver?: unknown;
+  } | null;
+  isNodelink?: unknown;
+};
+
+type NodeLinkClientOptions = {
+  baseUrl?: string | null;
+  password?: string | null;
+  requestTimeoutMs?: number | null;
+  linkTimeoutMs?: number | null;
+  streamStartTimeoutMs?: number | null;
+  defaultSearchIdentifier?: string | null;
+};
+
+type LoadTracksOptions = {
+  searchIdentifier?: string | null;
+};
+
+type StreamTrackOptions = {
+  positionMs?: number;
+  volume?: number;
+  filters?: Record<string, unknown>;
+  guildId?: string | null;
+};
+
+function parsePositiveInt(value: unknown, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function normalizeBaseUrl(value: unknown): string | null {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  try {
+    return new URL(raw).toString().replace(/\/$/, '');
+  } catch {
+    return null;
+  }
+}
+
+function normalizeSearchIdentifier(value: unknown): string {
+  const normalized = String(value ?? '').trim();
+  return normalized || 'search';
+}
+
+function getErrorMessage(value: unknown): string {
+  if (!(value instanceof Error)) return String(value ?? 'Unknown error');
+  // undici reports network failures as a bare "fetch failed"; the real reason
+  // (ECONNREFUSED, ENOTFOUND, timeout, TLS…) is in `cause`.
+  const cause = (value as Error & { cause?: unknown }).cause;
+  if (value.message === 'fetch failed' && cause) {
+    const code = String((cause as { code?: unknown }).code ?? '').trim();
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    return `cannot reach NodeLink (${[code, detail].filter(Boolean).join(': ')})`;
+  }
+  return value.message;
+}
+
+export class NodeLinkClient {
+  baseUrl: string | null;
+  password: string | null;
+  requestTimeoutMs: number;
+  linkTimeoutMs: number;
+  streamStartTimeoutMs: number;
+  defaultSearchIdentifier: string;
+  lastRequestAtMs: number;
+  lastRequestType: 'loadtracks' | 'loadstream' | 'info' | null;
+  lastError: string | null;
+  lastInfo: NodeLinkInfo | null;
+
+  constructor(options: NodeLinkClientOptions = {}) {
+    this.baseUrl = normalizeBaseUrl(options.baseUrl ?? process.env.NODELINK_BASE_URL ?? null);
+    this.password = String(options.password ?? process.env.NODELINK_PASSWORD ?? '').trim() || null;
+    this.requestTimeoutMs = parsePositiveInt(
+      options.requestTimeoutMs ?? process.env.NODELINK_REQUEST_TIMEOUT_MS,
+      15_000
+    );
+    this.linkTimeoutMs = parsePositiveInt(
+      options.linkTimeoutMs ?? process.env.NODELINK_LINK_TIMEOUT_MS,
+      30_000
+    );
+    this.streamStartTimeoutMs = parsePositiveInt(
+      options.streamStartTimeoutMs ?? process.env.NODELINK_STREAM_START_TIMEOUT_MS,
+      10_000
+    );
+    this.defaultSearchIdentifier = normalizeSearchIdentifier(
+      options.defaultSearchIdentifier ?? process.env.NODELINK_DEFAULT_SEARCH
+    );
+    this.lastRequestAtMs = 0;
+    this.lastRequestType = null;
+    this.lastError = null;
+    this.lastInfo = null;
+  }
+
+  get enabled(): boolean {
+    return Boolean(this.baseUrl);
+  }
+
+  headers(extra: Record<string, string> = {}): Record<string, string> {
+    return {
+      ...(this.password ? { authorization: this.password } : {}),
+      ...extra,
+    };
+  }
+
+  getDiagnostics(): Record<string, unknown> {
+    return {
+      enabled: this.enabled,
+      baseUrl: this.baseUrl,
+      defaultSearchIdentifier: this.defaultSearchIdentifier,
+      requestTimeoutMs: this.requestTimeoutMs,
+      streamStartTimeoutMs: this.streamStartTimeoutMs,
+      lastRequestAtMs: this.lastRequestAtMs || null,
+      lastRequestType: this.lastRequestType,
+      lastError: this.lastError,
+      info: this.lastInfo
+        ? {
+            isNodelink: Boolean(this.lastInfo.isNodelink),
+            version: String(this.lastInfo.version?.semver ?? '').trim() || null,
+          }
+        : null,
+    };
+  }
+
+  buildIdentifier(query: string, options: LoadTracksOptions = {}): string {
+    const raw = String(query ?? '').trim();
+    if (/^https?:\/\//i.test(raw)) return raw;
+    if (isNodeLinkSourceIdentifier(raw)) return raw;
+    const searchIdentifier = normalizeSearchIdentifier(options.searchIdentifier ?? this.defaultSearchIdentifier);
+    return `${searchIdentifier}:${raw}`;
+  }
+
+  timeoutForIdentifier(identifier: string): number {
+    const isLink = /^https?:\/\//i.test(String(identifier ?? '').trim());
+    return isLink ? Math.max(this.requestTimeoutMs, this.linkTimeoutMs) : this.requestTimeoutMs;
+  }
+
+  async loadTracks(query: string, options: LoadTracksOptions = {}): Promise<NodeLinkLoadResult> {
+    if (!this.baseUrl) {
+      throw new ValidationError('NodeLink is not configured.');
+    }
+
+    this.lastRequestAtMs = Date.now();
+    this.lastRequestType = 'loadtracks';
+    const identifier = this.buildIdentifier(query, options);
+    const endpoint = new URL('/v4/loadtracks', this.baseUrl);
+    endpoint.searchParams.set('identifier', identifier);
+
+    const response = await fetch(endpoint, {
+      method: 'GET',
+      headers: this.headers({ accept: 'application/json' }),
+      signal: AbortSignal.timeout(this.timeoutForIdentifier(identifier)),
+    }).catch((err) => {
+      this.lastError = `NodeLink load failed: ${getErrorMessage(err)}`;
+      throw new ValidationError(`NodeLink load failed: ${getErrorMessage(err)}`);
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      this.lastError = `NodeLink load failed (${response.status}): ${describeNodeLinkErrorBody(body, response.statusText)}`;
+      throw new ValidationError(this.lastError);
+    }
+
+    const payload = await response.json().catch((err) => {
+      this.lastError = `NodeLink load returned invalid JSON: ${getErrorMessage(err)}`;
+      throw new ValidationError(`NodeLink load returned invalid JSON: ${getErrorMessage(err)}`);
+    }) as NodeLinkLoadResult;
+    this.lastError = null;
+    return payload;
+  }
+
+  async getInfo(timeoutMs = Math.min(this.requestTimeoutMs, 5_000)): Promise<NodeLinkInfo> {
+    if (!this.baseUrl) {
+      throw new ValidationError('NodeLink is not configured.');
+    }
+
+    this.lastRequestAtMs = Date.now();
+    this.lastRequestType = 'info';
+    const response = await fetch(new URL('/v4/info', this.baseUrl), {
+      method: 'GET',
+      headers: this.headers({ accept: 'application/json' }),
+      signal: AbortSignal.timeout(timeoutMs),
+    }).catch((err) => {
+      this.lastError = `NodeLink info failed: ${getErrorMessage(err)}`;
+      throw new ValidationError(`NodeLink info failed: ${getErrorMessage(err)}`);
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      this.lastError = `NodeLink info failed (${response.status}): ${describeNodeLinkErrorBody(body, response.statusText)}`;
+      throw new ValidationError(this.lastError);
+    }
+
+    const payload = await response.json().catch((err) => {
+      this.lastError = `NodeLink info returned invalid JSON: ${getErrorMessage(err)}`;
+      throw new ValidationError(`NodeLink info returned invalid JSON: ${getErrorMessage(err)}`);
+    }) as NodeLinkInfo;
+    this.lastInfo = payload;
+    this.lastError = null;
+    return payload;
+  }
+
+  async streamTrack(track: Track, options: StreamTrackOptions = {}): Promise<Readable> {
+    const encodedTrack = String(track.nodelinkEncodedTrack ?? '').trim();
+    if (!this.baseUrl || !encodedTrack) {
+      throw new ValidationError('Track is missing a NodeLink encoded track.');
+    }
+
+    this.lastRequestAtMs = Date.now();
+    this.lastRequestType = 'loadstream';
+    const response = await fetch(new URL('/v4/loadstream', this.baseUrl), {
+      method: 'POST',
+      headers: this.headers({
+        accept: 'audio/l16',
+        'content-type': 'application/json',
+      }),
+      body: JSON.stringify({
+        encodedTrack,
+        volume: options.volume ?? 100,
+        position: options.positionMs ?? 0,
+        filters: options.filters ?? {},
+        ...(options.guildId ? { guildId: options.guildId } : {}),
+      }),
+    }).catch((err) => {
+      this.lastError = `NodeLink stream failed: ${getErrorMessage(err)}`;
+      throw new ValidationError(`NodeLink stream failed: ${getErrorMessage(err)}`);
+    });
+
+    if (!response.ok || !response.body) {
+      const body = await response.text().catch(() => '');
+      this.lastError = `NodeLink stream failed (${response.status}): ${describeNodeLinkErrorBody(body, response.statusText)}`;
+      throw new ValidationError(this.lastError);
+    }
+
+    this.lastError = null;
+    return Readable.fromWeb(response.body as unknown as import('node:stream/web').ReadableStream);
+  }
+}

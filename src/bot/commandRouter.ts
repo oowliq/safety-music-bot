@@ -1,0 +1,1161 @@
+import { ValidationError } from '../core/errors.ts';
+import { createTranslator, DEFAULT_LOCALE, resolveLocale, type Locale } from '../i18n/index.ts';
+import { baseLimits } from './services/limits.ts';
+import { parseCommand } from '../utils/commandParser.ts';
+import { safeFetch } from '../utils/safeHttp.ts';
+import { findFallbackAutoplayTrack, type AutoplayTrackLike } from './autoplayFallback.ts';
+import { buildEmbed, makeResponder, sourceColor } from './messageFormatter.ts';
+import { maskedLink, subtext } from './fluxerMarkdown.ts';
+import { buildNowPlayingCardFile, isCardEnabled, type CardTrack } from './cards/cardService.ts';
+import { buildTrackAuthor } from './commands/helpers/formatting.ts';
+import { CommandRegistry } from './commandRegistry.ts';
+import { registerCommands } from './commands/index.ts';
+import { CommandRateLimiter } from './services/commandRateLimiter.ts';
+import {
+  SEARCH_PICK_EMOJIS,
+  buildCommandReplyOptions,
+  isDirectBotMention,
+  isLeftEmoji,
+  isRightEmoji,
+  normalizeEmojiName,
+  parseMentionCommand,
+  parseSearchPickIndex,
+  SEND_PERMISSION_PREFLIGHT_BYPASS,
+  summarizeTrack,
+} from './commandRouterUtils.ts';
+import {
+  applySearchReactionSelection,
+  registerHelpPagination,
+  registerSearchReactionSelection,
+  runWeeklyRecapSweep,
+  safeReply,
+  sendPaginated,
+} from './commandRouterOperations.ts';
+import type { BivariantCallback, CommandDefinition, MessagePayload, ReplyOptions, LoggerLike } from '../types/core.ts';
+import type { ShardTotals } from './services/shardRegistry.ts';
+
+type RouterContextOptions = {
+  prefix?: string;
+  guildConfig?: { prefix?: string; settings?: { minimalMode?: boolean; language?: string | null; commandChannelIds?: string[] } } | null;
+  locale?: Locale;
+};
+
+type RouterConfig = {
+  prefix: string;
+  maxPlaylistTracks?: number | null;
+  searchResultLimit?: number;
+  playCommandCooldownMs?: number;
+  maxFavoritesPerUser?: number;
+  allowDefaultPrefixFallback?: boolean;
+  commandRateLimitEnabled?: boolean;
+  commandUserWindowMs?: number;
+  commandUserMax?: number;
+  commandGuildWindowMs?: number;
+  commandGuildMax?: number;
+  commandRateLimitBypass?: string[];
+  enableEmbeds?: boolean;
+  sessionIdleMs: number;
+  searchPickTimeoutMs?: number;
+  [key: string]: unknown;
+};
+
+type GuildConfigResolver = {
+  get: (guildId: string) => Promise<{ prefix?: string; settings?: { minimalMode?: boolean; language?: string | null; commandChannelIds?: string[]; nowPlayingCard?: string | null } } | null>;
+};
+
+type RouterRest = {
+  sendTyping: (channelId: string) => Promise<unknown>;
+  editMessage: (channelId: string, messageId: string, payload: MessagePayload) => Promise<unknown>;
+  addReactionToMessage?: (channelId: string, messageId: string, emoji: string) => Promise<unknown>;
+  removeUserReactionFromMessage?: (channelId: string, messageId: string, emoji: string, userId: string) => Promise<unknown>;
+  sendMessage: (channelId: string, payload: MessagePayload) => Promise<unknown>;
+  deleteMessage?: (channelId: string, messageId: string) => Promise<unknown>;
+  sendFile?: (
+    channelId: string,
+    file: { filename: string; contentType: string; data: Uint8Array; description?: string | null },
+    payload?: MessagePayload,
+  ) => Promise<unknown>;
+  listCurrentUserGuilds?: (options?: { limit?: number; after?: string | null }) => Promise<unknown>;
+};
+
+type SessionLookup = {
+  guildId?: string | null;
+  sessionId?: string | null;
+  textChannelId?: string | null;
+  activeVoiceChannelId?: string | null;
+  settings?: {
+    musicLogChannelId?: string | null;
+    stayInVoiceEnabled?: boolean;
+    minimalMode?: boolean;
+    dedupeEnabled?: boolean;
+    voteSkipRatio?: number;
+    voteSkipMinVotes?: number;
+    autoplayEnabled?: boolean;
+  };
+  connection?: {
+    channelId?: string | null;
+  };
+  player?: {
+    playing?: boolean;
+    currentTrack?: unknown;
+    pendingTracks?: unknown[];
+    historyTracks?: unknown[];
+    previewTracks?: BivariantCallback<[string, { requestedBy?: string | null; limit?: number }], Promise<unknown[]>>;
+    searchCandidates?: BivariantCallback<[string, number?, { requestedBy?: string | null }?], Promise<unknown[]>>;
+    getProgressSeconds?: () => number;
+    createTrackFromData?: (track: unknown, requestedBy?: string | null) => unknown;
+    enqueueResolvedTracks?: (tracks: unknown[], options?: Record<string, unknown>) => unknown[];
+    play?: () => Promise<unknown>;
+  };
+};
+
+type SessionManagerLike = {
+  has: (guildId: string, selector?: Record<string, unknown>) => boolean;
+  bindTextChannel: (guildId: string, channelId: string, selector?: Record<string, unknown>) => unknown;
+  get: (guildId: string, selector?: Record<string, unknown>) => SessionLookup | null;
+  destroy: (guildId: string, reason?: string, selector?: Record<string, unknown>) => Promise<unknown>;
+  on: (event: string, handler: BivariantCallback<unknown[], void | Promise<void>>) => unknown;
+  sessions: Map<string, SessionLookup>;
+};
+
+type RouterMessage = Record<string, unknown> & {
+  content?: string;
+  channel_id?: string;
+  guild_id?: string;
+  user_id?: string;
+  author?: { id?: string; bot?: boolean } | null;
+  member?: { user?: { id?: string } | null } | null;
+};
+
+type RouterReactionPayload = Record<string, unknown> & {
+  guild_id?: string;
+  guildId?: string;
+  channel_id?: string;
+  channelId?: string;
+  message_id?: string;
+  messageId?: string;
+  user_id?: string;
+  userId?: string;
+  emoji?: { name?: string | null } | null;
+  emoji_name?: string | null;
+  reaction?: string | null;
+  member?: { user?: { id?: string } | null } | null;
+};
+
+type SessionEventPayload = {
+  session?: SessionLookup | null;
+  track?: { title?: string; duration?: string; requestedBy?: string | null; source?: string | null; metadataDeferred?: boolean } | null;
+  error?: { message?: string | null } | null;
+  reason?: string | null;
+  seekRestart?: boolean;
+  skipped?: boolean;
+  restoredFromPersistentSession?: boolean;
+};
+
+type VoiceStateStoreLike = {
+  resolveMemberVoiceChannel?: (message: Record<string, unknown>) => string | null;
+  countUsersInChannel: (guildId: string, channelId: string, excludedUserIds?: string[]) => number;
+};
+
+type LibraryLike = {
+  recordUserSignal?: (guildId: string, userId: string, signal: string, track?: unknown) => Promise<unknown>;
+  appendGuildHistory?: (guildId: string, track: unknown) => Promise<unknown>;
+  getGuildFeatureConfig?: (guildId: string) => Promise<{ webhookUrl?: string | null; recapChannelId?: string | null; queueGuard?: unknown } | null>;
+  buildGuildRecap?: (guildId: string, days?: number) => Promise<{ playCount: number; topTracks: Array<{ title: string; plays: number }>; topRequesters: Array<{ userId: string; plays: number }> } | null>;
+  getRecapState?: (guildId: string) => Promise<{ lastWeeklyRecapAt?: string | Date | null } | null>;
+  markRecapSent?: (guildId: string, sentAt?: Date) => Promise<unknown>;
+};
+
+type PermissionServiceLike = {
+  canBotSendMessages: (guildId: string, channelId: string) => Promise<boolean | null>;
+  canBotJoinAndSpeak?: (guildId: string, channelId: string) => Promise<boolean | null>;
+  canBotMoveMembers?: (guildId: string, channelId: string) => Promise<boolean | null>;
+};
+
+type MetricsLike = {
+  commandsTotal?: {
+    inc?: (value?: number, labels?: Record<string, string>) => void;
+  };
+};
+
+type ErrorReporterLike = {
+  captureException?: (error: unknown, context?: Record<string, unknown>) => void;
+};
+
+type HelpPaginationState = {
+  channelId: string;
+  messageId: string;
+  pages: MessagePayload[];
+  index: number;
+  updatedAt: number;
+};
+
+type SearchReactionState = {
+  guildId: string;
+  channelId: string;
+  messageId: string;
+  userId: string;
+  tracks: unknown[];
+  expiresAt: number;
+};
+
+const COMMAND_CHANNEL_EXEMPT = new Set(['musicchannel', 'settings', 'prefix', 'language']);
+const COMMAND_CHANNEL_NOTICE_COOLDOWN_MS = 30_000;
+const COMMAND_CHANNEL_NOTICE_LIFETIME_MS = 10_000;
+const DEFERRED_TRACK_START_MESSAGE_GRACE_MS = 1200;
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+type RouterLogger = LoggerLike;
+
+type CommandRouterOptions = {
+  config: RouterConfig;
+  logger?: RouterLogger;
+  rest: RouterRest;
+  gateway: Record<string, unknown>;
+  sessions: SessionManagerLike;
+  guildConfigs?: GuildConfigResolver | null;
+  voiceStateStore: VoiceStateStoreLike;
+  lyrics: unknown;
+  library?: LibraryLike | null;
+  permissionService?: PermissionServiceLike | null;
+  guildStateCache?: unknown;
+  shardTotals?: (() => Promise<ShardTotals | null>) | null;
+  botUserId?: string | null;
+  startedAt?: number | Date | null;
+  metrics?: MetricsLike | null;
+  errorReporter?: ErrorReporterLike | null;
+  commandRateLimiter?: CommandRateLimiter | null;
+};
+
+export class CommandRouter {
+  config: RouterConfig;
+  logger: RouterLogger | undefined;
+  rest: RouterRest;
+  gateway: Record<string, unknown>;
+  sessions: SessionManagerLike;
+  guildConfigs: GuildConfigResolver | null;
+  voiceStateStore: VoiceStateStoreLike;
+  lyrics: unknown;
+  library: LibraryLike | null;
+  permissionService: PermissionServiceLike | null;
+  guildStateCache: unknown;
+  shardTotals: (() => Promise<ShardTotals | null>) | null;
+  botUserId: string | null;
+  startedAt: number | Date | null | undefined;
+  metrics: MetricsLike | null;
+  errorReporter: ErrorReporterLike | null;
+  guildOpLocks: Map<string, number>;
+  helpPaginations: Map<string, HelpPaginationState>;
+  searchReactionSelections: Map<string, SearchReactionState>;
+  nowPlayingMessages: Map<string, { channelId: string; messageId: string; isCard?: boolean }>;
+  commandChannelNotices: Map<string, number>;
+  lastPlayedTracks: Map<string, Record<string, unknown>>;
+  autoplaySeeds: Map<string, { artist: string; track: string; playedIdentity: string }>;
+  weeklySweepHandle: NodeJS.Timeout | null;
+  ephemeralCleanupHandle: NodeJS.Timeout | null;
+  commandRateLimiter: CommandRateLimiter;
+  responder: ReturnType<typeof makeResponder>;
+  registry: CommandRegistry;
+  constructor(options: CommandRouterOptions) {
+    this.config = options.config;
+    this.logger = options.logger;
+    this.rest = options.rest;
+    this.gateway = options.gateway;
+    this.sessions = options.sessions;
+    this.guildConfigs = options.guildConfigs ?? null;
+    this.voiceStateStore = options.voiceStateStore;
+    this.lyrics = options.lyrics;
+    this.library = options.library ?? null;
+    this.permissionService = options.permissionService ?? null;
+    this.guildStateCache = options.guildStateCache ?? null;
+    this.shardTotals = options.shardTotals ?? null;
+    this.botUserId = options.botUserId ?? null;
+    this.startedAt = options.startedAt;
+    this.metrics = options.metrics ?? null;
+    this.errorReporter = options.errorReporter ?? null;
+    this.guildOpLocks = new Map();
+    this.helpPaginations = new Map();
+    this.searchReactionSelections = new Map();
+    this.nowPlayingMessages = new Map();
+    this.commandChannelNotices = new Map();
+    this.lastPlayedTracks = new Map();
+    this.autoplaySeeds = new Map();
+    this.weeklySweepHandle = null;
+    this.ephemeralCleanupHandle = null;
+    const rateLimiterOptions = {
+      ...(this.logger?.child ? { logger: this.logger.child('rate-limit') } : {}),
+      ...(this.config.commandRateLimitEnabled !== undefined ? { enabled: this.config.commandRateLimitEnabled } : {}),
+      ...(this.config.commandUserWindowMs !== undefined ? { userWindowMs: this.config.commandUserWindowMs } : {}),
+      ...(this.config.commandUserMax !== undefined ? { userMaxCommands: this.config.commandUserMax } : {}),
+      ...(this.config.commandGuildWindowMs !== undefined ? { guildWindowMs: this.config.commandGuildWindowMs } : {}),
+      ...(this.config.commandGuildMax !== undefined ? { guildMaxCommands: this.config.commandGuildMax } : {}),
+      ...(this.config.commandRateLimitBypass !== undefined ? { bypassCommands: this.config.commandRateLimitBypass } : {}),
+    };
+    this.commandRateLimiter = options.commandRateLimiter ?? new CommandRateLimiter(rateLimiterOptions);
+
+    this.responder = makeResponder(this.rest, this.config.enableEmbeds !== undefined
+      ? { enableEmbeds: this.config.enableEmbeds }
+      : {});
+
+    this.registry = new CommandRegistry();
+    registerCommands(this.registry);
+
+    this._bindSessionEvents();
+    this._startBackgroundTasks();
+  }
+
+  setBotUserId(botUserId: string | null | undefined) {
+    this.botUserId = botUserId ? String(botUserId) : null;
+  }
+
+  async handleMessage(message: RouterMessage) {
+    const content = String(message?.content ?? '');
+    const channelId = String(message?.channel_id ?? '').trim();
+    if (!content || !channelId) return;
+    if (message.author?.bot) return;
+
+    const guildId = message.guild_id ?? null;
+    const guildConfig = await this._resolveGuildConfig(guildId);
+    const configuredPrefix = guildConfig?.prefix ?? this.config.prefix;
+    const fallbackPrefix = this.config.prefix;
+    if (isDirectBotMention(content, this.botUserId)) {
+      await this._safeReply(
+        channelId,
+        'info',
+        `Use \`${configuredPrefix}help\` to see all commands.`,
+        undefined,
+        undefined
+      );
+      return;
+    }
+
+    let parsed = parseCommand(content, configuredPrefix);
+    if (!parsed && this.config.allowDefaultPrefixFallback && configuredPrefix !== fallbackPrefix) {
+      parsed = parseCommand(content, fallbackPrefix);
+    }
+    if (!parsed) {
+      parsed = parseMentionCommand(content, this.botUserId);
+    }
+    if (!parsed) return;
+
+    const command = this.registry.resolve(parsed.name);
+    if (!command) {
+      this.metrics?.commandsTotal?.inc?.(1, { command: 'unknown', outcome: 'unknown' });
+      return;
+    }
+
+    const locale = await this._resolveLocale(
+      message.author?.id ?? message.user_id ?? message.member?.user?.id ?? null,
+      guildConfig
+    );
+
+    const context = this._buildContext(message, parsed, command, {
+      prefix: configuredPrefix,
+      guildConfig,
+      locale,
+    });
+    if (context.guildId && this._isOutsideCommandChannels(guildConfig, channelId, command.name)) {
+      this.metrics?.commandsTotal?.inc?.(1, { command: command.name, outcome: 'wrong_channel' });
+      await this._redirectToCommandChannels(message, channelId, guildConfig?.settings?.commandChannelIds ?? [], context.t);
+      return;
+    }
+
+    try {
+      if (
+        context.guildId
+        && this.permissionService
+        && !SEND_PERMISSION_PREFLIGHT_BYPASS.has(String(command.name ?? '').toLowerCase())
+      ) {
+        const canSend = await this.permissionService.canBotSendMessages(context.guildId, context.channelId);
+        if (canSend === false) {
+          this.logger?.warn?.('Bot lacks send permission in command channel', {
+            guildId: context.guildId,
+            channelId: context.channelId,
+            command: command.name,
+          });
+          this.metrics?.commandsTotal?.inc?.(1, { command: command.name, outcome: 'blocked_bot_send_perm' });
+          return;
+        }
+      }
+
+      const rateCheck = this.commandRateLimiter.consume({
+        guildId: context.guildId,
+        userId: context.authorId,
+        commandName: command.name,
+      });
+      if (!rateCheck.allowed) {
+        const retrySec = Math.max(0.1, (rateCheck.retryAfterMs ?? 1_000) / 1000).toFixed(1);
+        throw new ValidationError(context.t('errors.rateLimit', { scope: String(rateCheck.scope), seconds: retrySec }));
+      }
+
+      const commandName = String(command.name ?? '').trim();
+      if (!command.execute || !commandName) {
+        throw new ValidationError(context.t('errors.notExecutable', { command: String(command.name) }));
+      }
+      await command.execute(context);
+      this.metrics?.commandsTotal?.inc?.(1, { command: commandName, outcome: 'success' });
+    } catch (err) {
+      const commandName = String(command.name ?? '').trim() || 'unknown';
+      if (err instanceof ValidationError) {
+        this.metrics?.commandsTotal?.inc?.(1, { command: commandName, outcome: 'validation_error' });
+        const localized = err.translationKey
+          ? context.t.optional(err.translationKey, err.translationParams ?? undefined)
+          : null;
+        await context.reply.warning(localized ?? err.message);
+        return;
+      }
+
+      this.metrics?.commandsTotal?.inc?.(1, { command: commandName, outcome: 'internal_error' });
+      this.logger?.error?.('Command execution failed', {
+        command: commandName,
+        guildId: context.guildId,
+        channelId: context.channelId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      this.errorReporter?.captureException?.(err, {
+        source: 'command_router',
+        command: commandName,
+        guildId: context.guildId,
+        channelId: context.channelId,
+      });
+
+      await context.reply.error(context.t('errors.unexpected'));
+    }
+  }
+
+  async handleReactionAdd(payload: RouterReactionPayload) {
+    const guildId = payload?.guild_id ?? payload?.guildId ?? null;
+    const channelId = payload?.channel_id ?? payload?.channelId ?? null;
+    const messageId = payload?.message_id ?? payload?.messageId ?? null;
+    const userId = payload?.user_id ?? payload?.userId ?? payload?.member?.user?.id ?? null;
+    if (!guildId || !channelId || !messageId || !userId) return;
+    if (this.botUserId && String(userId) === String(this.botUserId)) return;
+
+    const emoji = normalizeEmojiName(payload);
+    const pageState = this.helpPaginations.get(String(messageId));
+    if (pageState) {
+      const direction = isLeftEmoji(emoji) ? -1 : (isRightEmoji(emoji) ? 1 : 0);
+      if (direction !== 0) {
+        const reactionEmoji = direction < 0 ? '\u2B05\uFE0F' : '\u27A1\uFE0F';
+        await this.rest.removeUserReactionFromMessage?.(String(channelId), String(messageId), reactionEmoji, String(userId)).catch(() => null);
+        const nextIndex = Math.max(0, Math.min(pageState.pages.length - 1, pageState.index + direction));
+        if (nextIndex !== pageState.index) {
+          pageState.index = nextIndex;
+          pageState.updatedAt = Date.now();
+          const currentPage = pageState.pages[pageState.index];
+          if (currentPage) {
+            await this.rest.editMessage(pageState.channelId, pageState.messageId, currentPage).catch(() => null);
+          }
+        }
+      }
+      return;
+    }
+
+    const searchState = this.searchReactionSelections.get(String(messageId));
+    if (searchState) {
+      if (Date.now() > searchState.expiresAt) {
+        this.searchReactionSelections.delete(String(messageId));
+        return;
+      }
+
+      if (String(userId) !== String(searchState.userId)) {
+        return;
+      }
+
+      const pickedIndex = parseSearchPickIndex(emoji);
+      if (!pickedIndex || pickedIndex > searchState.tracks.length) {
+        return;
+      }
+
+      const reactionEmoji = SEARCH_PICK_EMOJIS[pickedIndex - 1] ?? emoji;
+      await this.rest.removeUserReactionFromMessage?.(String(channelId), String(messageId), reactionEmoji, String(userId)).catch(() => null);
+      this.searchReactionSelections.delete(String(messageId));
+      await this._applySearchReactionSelection(searchState, pickedIndex, userId);
+      return;
+    }
+
+    return;
+  }
+
+  _buildContext(message: RouterMessage, parsed: { name: string; args: string[]; rawArgs: string }, command: CommandDefinition, options: RouterContextOptions = {}) {
+    const channelId = String(message.channel_id ?? '').trim();
+    const commandReplyOptions = buildCommandReplyOptions(message);
+    const activeVoiceChannelId = this.voiceStateStore.resolveMemberVoiceChannel?.(message) ?? null;
+
+    return {
+      config: {
+        ...this.config,
+        ...(options.guildConfig?.settings?.minimalMode === true ? { minimalMode: true } : {}),
+        ...baseLimits(this.config),
+      },
+      prefix: options.prefix ?? this.config.prefix,
+      logger: this.logger,
+      rest: this.rest,
+      gateway: this.gateway,
+      sessions: this.sessions,
+      guildConfigs: this.guildConfigs,
+
+      guildConfig: options.guildConfig ?? null,
+      locale: options.locale ?? DEFAULT_LOCALE,
+      t: createTranslator(options.locale ?? DEFAULT_LOCALE),
+      voiceStateStore: this.voiceStateStore,
+      lyrics: this.lyrics,
+      library: this.library,
+      permissionService: this.permissionService,
+      guildStateCache: this.guildStateCache,
+      shardTotals: this.shardTotals,
+      botUserId: this.botUserId,
+      registry: this.registry,
+      startedAt: this.startedAt,
+      withGuildOpLock: (key: string, fn: () => Promise<unknown>) => this._withGuildOpLock(message.guild_id ?? null, key, fn),
+      registerHelpPagination: async (channelId: string, messageId: string, pages: MessagePayload[], index?: number) => {
+        await this._registerHelpPagination(channelId, messageId, pages, index);
+      },
+      registerSearchReactionSelection: async (messageId: string, tracks: unknown[], timeoutMs: number | null = null) => {
+        await this._registerSearchReactionSelection({
+          guildId: message.guild_id ?? null,
+          channelId,
+          messageId,
+          userId: message.author?.id ?? message.user_id ?? message.member?.user?.id ?? null,
+          tracks,
+          timeoutMs,
+        });
+      },
+      sendPaginated: async (pages: MessagePayload[]) => {
+        await this._sendPaginated(channelId, pages, commandReplyOptions ?? null);
+      },
+
+      message,
+      command,
+      commandName: parsed.name,
+      args: parsed.args,
+      rawArgs: parsed.rawArgs,
+      guildId: message.guild_id ?? null,
+      channelId,
+      activeVoiceChannelId,
+      authorId: message.author?.id ?? message.user_id ?? message.member?.user?.id ?? null,
+
+      safeTyping: async () => {
+        this.rest.sendTyping(channelId).catch(() => {
+          // typing indicator is optional
+        });
+      },
+
+      reply: {
+        info: async (text: string, fields: unknown = null, embedOptions: unknown = null) => this._safeReply(
+          channelId, 'info', text, fields, commandReplyOptions ?? null, {
+            ...(embedOptions && typeof embedOptions === 'object' ? embedOptions as Record<string, unknown> : {}),
+            ...(options.guildConfig?.settings?.minimalMode === true ? { minimalMode: true } : {}),
+          }
+        ),
+        success: async (text: string, fields: unknown = null, embedOptions: unknown = null) => this._safeReply(
+          channelId, 'success', text, fields, commandReplyOptions ?? null, {
+            ...(embedOptions && typeof embedOptions === 'object' ? embedOptions as Record<string, unknown> : {}),
+            ...(options.guildConfig?.settings?.minimalMode === true ? { minimalMode: true } : {}),
+          }
+        ),
+        warning: async (text: string, fields: unknown = null, embedOptions: unknown = null) => this._safeReply(
+          channelId, 'warning', text, fields, commandReplyOptions ?? null, {
+            ...(embedOptions && typeof embedOptions === 'object' ? embedOptions as Record<string, unknown> : {}),
+            ...(options.guildConfig?.settings?.minimalMode === true ? { minimalMode: true } : {}),
+          }
+        ),
+        error: async (text: string, fields: unknown = null, embedOptions: unknown = null) => this._safeReply(
+          channelId, 'error', text, fields, commandReplyOptions ?? null, {
+            ...(embedOptions && typeof embedOptions === 'object' ? embedOptions as Record<string, unknown> : {}),
+            ...(options.guildConfig?.settings?.minimalMode === true ? { minimalMode: true } : {}),
+          }
+        ),
+        plain: async (text: string) => this._safeReply(channelId, 'plain', text, null, commandReplyOptions ?? null),
+      },
+    };
+  }
+
+  _isOutsideCommandChannels(
+    guildConfig: RouterContextOptions['guildConfig'],
+    channelId: string,
+    commandName: string | undefined,
+  ): boolean {
+    const allowed = guildConfig?.settings?.commandChannelIds ?? [];
+    if (!allowed.length || allowed.includes(channelId)) return false;
+    return !COMMAND_CHANNEL_EXEMPT.has(String(commandName ?? '').toLowerCase());
+  }
+
+  async _redirectToCommandChannels(
+    message: RouterMessage,
+    channelId: string,
+    allowed: string[],
+    t: ReturnType<typeof createTranslator>,
+  ) {
+    const messageId = String(message.id ?? '').trim();
+    if (messageId) {
+      await this.rest.deleteMessage?.(channelId, messageId).catch(() => null);
+    }
+
+    const now = Date.now();
+    const lastNotice = this.commandChannelNotices.get(channelId) ?? 0;
+    if (now - lastNotice < COMMAND_CHANNEL_NOTICE_COOLDOWN_MS) return;
+    this.commandChannelNotices.set(channelId, now);
+
+    const authorId = String(message.author?.id ?? message.user_id ?? '').trim();
+    const mention = authorId ? `<@${authorId}> ` : '';
+    const sent = await this.rest.sendMessage(channelId, {
+      content: `${mention}${t('musicchannel.redirect', { channels: allowed.map((id) => `<#${id}>`).join(', ') })}`,
+      allowed_mentions: { parse: [], users: authorId ? [authorId] : [], roles: [], replied_user: false },
+    }).catch(() => null);
+
+    const noticeId = String((sent as { id?: unknown } | null)?.id ?? '').trim();
+    if (!noticeId || !this.rest.deleteMessage) return;
+    const timer = setTimeout(() => {
+      this.rest.deleteMessage?.(channelId, noticeId).catch(() => null);
+    }, COMMAND_CHANNEL_NOTICE_LIFETIME_MS);
+    timer.unref?.();
+  }
+
+  async _withGuildOpLock(guildId: string | null, key: string, fn: () => Promise<unknown>) {
+    if (!guildId) return fn();
+    const lockKey = `${String(guildId)}:${String(key ?? 'default')}`;
+    if (this.guildOpLocks.has(lockKey)) {
+      throw new ValidationError('This action is already running. Please retry in a moment.', { translationKey: 'errors.actionRunning' });
+    }
+    this.guildOpLocks.set(lockKey, Date.now());
+    try {
+      return await fn();
+    } finally {
+      this.guildOpLocks.delete(lockKey);
+    }
+  }
+
+  async _resolveLocale(
+    userId: string | null,
+    guildConfig?: { settings?: { language?: string | null } } | null
+  ): Promise<Locale> {
+    let userLocale: string | null = null;
+
+    const library = this.library as { getUserLocale?: (userId: string) => Promise<string | null> } | null;
+    if (userId && typeof library?.getUserLocale === 'function') {
+      try {
+        userLocale = await library.getUserLocale(userId);
+      } catch (err) {
+        this.logger?.debug?.('Failed to resolve user locale', {
+          userId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    return resolveLocale({
+      userLocale,
+      guildLocale: guildConfig?.settings?.language ?? null,
+      fallbackLocale: this.config.defaultLanguage,
+    });
+  }
+
+  async _resolveGuildLocale(guildId: string | null): Promise<Locale> {
+    const guildConfig = await this._resolveGuildConfig(guildId);
+    return resolveLocale({
+      guildLocale: guildConfig?.settings?.language ?? null,
+      fallbackLocale: this.config.defaultLanguage,
+    });
+  }
+
+  async _resolveGuildConfig(guildId: string | null) {
+    if (!guildId || !this.guildConfigs) return null;
+
+    try {
+      return await this.guildConfigs.get(guildId);
+    } catch (err) {
+      this.logger?.warn?.('Failed to resolve guild config', {
+        guildId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+  }
+
+  _bindSessionEvents() {
+    this.sessions.on('trackStart', async (payload?: SessionEventPayload) => {
+      const { session, track, restoredFromPersistentSession } = payload ?? {};
+      const channelId = this._resolveEventChannelId(session);
+      if (!channelId || !track) return;
+      if (restoredFromPersistentSession) {
+        return;
+      }
+      const voiceChannelId = String(session?.connection?.channelId ?? '').trim();
+      const voiceChannelTag = voiceChannelId ? ` in <#${voiceChannelId}>` : '';
+      const isYouTubeMixPlaceholder = String(track?.source ?? '').trim().toLowerCase() === 'youtube'
+        && String(track?.title ?? '').trim() === 'YouTube Mix Track'
+        && String(track?.duration ?? '').trim().toLowerCase() === 'unknown';
+      if (isYouTubeMixPlaceholder) {
+        return;
+      }
+      if (track?.metadataDeferred === true) {
+        await delay(DEFERRED_TRACK_START_MESSAGE_GRACE_MS);
+        if (track?.metadataDeferred === true) {
+          this.logger?.debug?.('Skipping deferred trackStart popup until metadata is available', {
+            channelId,
+            voiceChannelId: voiceChannelId || null,
+            title: String(track?.title ?? '').trim() || null,
+            duration: String(track?.duration ?? '').trim() || null,
+          });
+          return;
+        }
+      }
+
+      const eventT = createTranslator(await this._resolveGuildLocale(session?.guildId ?? null));
+      const published = await this._publishNowPlaying(session, track, channelId, voiceChannelTag, eventT);
+      if (!published) {
+        await this._safeReply(
+          channelId,
+          'info',
+          eventT('events.nowPlaying', { channel: voiceChannelTag, title: String(track.title), duration: String(track.duration) }),
+          null,
+          null,
+          session?.settings?.minimalMode ? { minimalMode: true } : undefined
+        );
+      }
+      await this._emitWebhookEvent(session, 'track_start', `Now playing${voiceChannelTag}: ${summarizeTrack(track)}`);
+    });
+
+    this.sessions.on('trackError', async (payload?: SessionEventPayload) => {
+      const { session, track, error } = payload ?? {};
+      const channelId = this._resolveEventChannelId(session);
+      if (!channelId) return;
+      const eventT = createTranslator(await this._resolveGuildLocale(session?.guildId ?? null));
+      await this._safeReply(
+        channelId,
+        'error',
+        eventT('events.trackError', { title: String(track?.title ?? eventT('common.unknown')), error: String(error?.message ?? eventT('errors.unknown')) }),
+        null,
+        null,
+        session?.settings?.minimalMode ? { minimalMode: true } : undefined
+      );
+      await this._emitWebhookEvent(session, 'track_error', `Playback error: ${error?.message ?? 'unknown error'}`);
+    });
+
+    this.sessions.on('queueEmpty', async (payload?: SessionEventPayload) => {
+      const { session, reason = null } = payload ?? {};
+      if (!session?.guildId) return;
+      this.nowPlayingMessages.delete(this._nowPlayingKey(session));
+      const activeSession = this.sessions.get(session.guildId, { sessionId: session?.sessionId });
+      if (activeSession && activeSession !== session) return;
+      const player = session?.player ?? null;
+      if (player?.playing || player?.currentTrack) {
+        this.logger?.debug?.('Skipping queueEmpty announcement while playback is still active', {
+          guildId: session?.guildId ?? null,
+          playing: Boolean(player?.playing),
+          hasCurrentTrack: Boolean(player?.currentTrack),
+        });
+        return;
+      }
+      if (reason === 'startup_error' || reason === 'startup_error_limit') {
+        this.logger?.debug?.('Skipping queueEmpty announcement for startup playback failure', {
+          guildId: session?.guildId ?? null,
+          reason,
+        });
+        return;
+      }
+
+      const autoplayedTitle = await this._tryAutoplay(session);
+      if (autoplayedTitle) {
+        const autoplayChannelId = this._resolveEventChannelId(session);
+        if (autoplayChannelId) {
+          const autoplayT = createTranslator(await this._resolveGuildLocale(session?.guildId ?? null));
+          await this._safeReply(
+            autoplayChannelId,
+            'info',
+            autoplayT('autoplay.queued', { track: autoplayedTitle }),
+            null,
+            null,
+            session?.settings?.minimalMode ? { minimalMode: true } : undefined
+          );
+        }
+        return;
+      }
+
+      const channelId = this._resolveEventChannelId(session);
+      if (!channelId) return;
+
+      const idleSeconds = Math.floor(this.config.sessionIdleMs / 1000);
+      const eventT = createTranslator(await this._resolveGuildLocale(session?.guildId ?? null));
+      const suffix = session.settings?.stayInVoiceEnabled
+        ? eventT('events.queueEmptyStay')
+        : eventT('events.queueEmptyDisconnect', { seconds: idleSeconds });
+      await this._safeReply(
+        channelId,
+        'info',
+        eventT('events.queueEmpty', { suffix }),
+        null,
+        null,
+        session?.settings?.minimalMode ? { minimalMode: true } : undefined
+      );
+      await this._emitWebhookEvent(session, 'queue_empty', 'Queue is now empty.');
+    });
+
+    this.sessions.on('destroyed', async (payload?: SessionEventPayload) => {
+      const { session, reason } = payload ?? {};
+      const destroyedSessionId = String(session?.sessionId ?? '').trim();
+      if (destroyedSessionId) {
+        this.lastPlayedTracks.delete(destroyedSessionId);
+        this.autoplaySeeds.delete(destroyedSessionId);
+      }
+      const channelId = this._resolveEventChannelId(session);
+      if (!channelId) return;
+      if (reason === 'manual_command' || reason === 'shutdown') return;
+
+      const eventT = createTranslator(await this._resolveGuildLocale(session?.guildId ?? null));
+      const reasonText = reason === 'idle_timeout'
+        ? eventT('events.sessionClosedIdle')
+        : reason === 'removed_from_voice'
+          ? eventT('events.sessionClosedRemoved')
+          : reason === 'removed_from_voice_repeatedly'
+            ? eventT('events.sessionClosedRemovedRepeatedly')
+            : eventT('events.sessionClosed', { reason: String(reason) });
+
+      await this._safeReply(channelId, 'warning', reasonText, null, null, session?.settings?.minimalMode ? { minimalMode: true } : undefined);
+      await this._emitWebhookEvent(session, 'session_closed', reasonText);
+    });
+
+    this.sessions.on('trackEnd', async (payload?: SessionEventPayload) => {
+      const { session, track, seekRestart, skipped } = payload ?? {};
+      if (!session?.guildId || !track || seekRestart) return;
+
+      const sessionId = String(session.sessionId ?? '').trim();
+      if (sessionId) this.lastPlayedTracks.set(sessionId, track as Record<string, unknown>);
+      if (!this.library) return;
+
+      await this.library.appendGuildHistory?.(session.guildId, track).catch((err) => {
+        this.logger?.warn?.('Failed to persist guild history entry', {
+          guildId: session.guildId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+
+      if (this.library.recordUserSignal && track?.requestedBy && /^\d{6,}$/.test(String(track.requestedBy))) {
+        await this.library
+          .recordUserSignal(session.guildId, String(track.requestedBy), skipped ? 'skip' : 'play', track)
+          .catch(() => null);
+      }
+    });
+  }
+
+  _skipAutoplay(session: SessionLookup | null | undefined, reason: string, context: Record<string, unknown> = {}): null {
+    this.logger?.info?.('Autoplay found nothing to queue', {
+      guildId: session?.guildId ?? null,
+      reason,
+      ...context,
+    });
+    return null;
+  }
+
+  async _tryAutoplay(session: SessionLookup | null | undefined): Promise<string | null> {
+    if (session?.settings?.autoplayEnabled !== true) return null;
+
+    const guildId = String(session?.guildId ?? '').trim();
+    const voiceChannelId = String(session?.connection?.channelId ?? '').trim();
+    if (guildId && voiceChannelId) {
+      const listeners = this.voiceStateStore.countUsersInChannel(
+        guildId,
+        voiceChannelId,
+        this.botUserId ? [this.botUserId] : [],
+      );
+      if (listeners <= 0) return this._skipAutoplay(session, 'nobody is listening');
+    }
+
+    const player = session?.player;
+    if (!player?.previewTracks || !player.enqueueResolvedTracks || !player.play) {
+      return this._skipAutoplay(session, 'player cannot queue');
+    }
+
+    const sessionId = String(session?.sessionId ?? '').trim();
+    const previous = sessionId ? this.lastPlayedTracks.get(sessionId) : null;
+
+    const startedAt = Date.now();
+    const fallback = await findFallbackAutoplayTrack(
+      player,
+      previous as AutoplayTrackLike | null,
+      (Array.isArray(player.historyTracks) ? player.historyTracks : []) as AutoplayTrackLike[],
+    );
+    if (!fallback) {
+      return this._skipAutoplay(session, 'no related track found', {
+        title: String((previous as { title?: unknown } | null)?.title ?? '').trim() || null,
+        resolveMs: Date.now() - startedAt,
+      });
+    }
+
+    const added = player.enqueueResolvedTracks([fallback.track], { dedupe: false });
+    if (!added?.length) return this._skipAutoplay(session, 'queue rejected the related track');
+    if (!player.playing) await player.play().catch(() => null);
+    this.logger?.info?.('Autoplay queued a related track', {
+      guildId: session?.guildId ?? null,
+      strategy: fallback.strategy,
+      resolveMs: Date.now() - startedAt,
+    });
+    return String((added[0] as { title?: unknown })?.title ?? '');
+  }
+
+  _resolveEventChannelId(session: SessionLookup | null | undefined) {
+    return session?.settings?.musicLogChannelId ?? session?.textChannelId ?? null;
+  }
+
+  async _publishNowPlaying(
+    session: SessionLookup | null | undefined,
+    track: Record<string, unknown>,
+    channelId: string,
+    voiceChannelTag: string,
+    eventT: ReturnType<typeof createTranslator>,
+  ): Promise<boolean> {
+    if (session?.settings?.minimalMode === true) return false;
+    if (this.config.enableEmbeds === false) return false;
+
+    const guildId = String(session?.guildId ?? '').trim();
+    if (!guildId) return false;
+    const messageKey = this._nowPlayingKey(session);
+
+    const title = String(track?.title ?? '').trim() || 'Unknown';
+    const duration = String(track?.duration ?? '').trim() || 'Unknown';
+    const url = String(track?.url ?? '').trim();
+    const requestedBy = String(track?.requestedBy ?? '').trim();
+    const scrobblerFooter: string | null = null;
+
+    const cardSent = await this._publishNowPlayingCard(session, track, channelId, messageKey, requestedBy, scrobblerFooter, eventT);
+    if (cardSent) return true;
+
+    const descriptionParts = [maskedLink(`**${title}**`, url) || `**${title}**`, `\`${duration}\``];
+    if (requestedBy) descriptionParts.push(`| <@${requestedBy}>`);
+
+    const embed = buildEmbed({
+      title: session?.connection?.channelId
+        ? eventT('events.nowPlayingTitleIn', { channel: `<#${String(session.connection.channelId)}>` })
+        : eventT('events.nowPlayingTitle'),
+      description: descriptionParts.join(' '),
+      color: sourceColor(track?.source as string | null | undefined),
+      thumbnailUrl: (track?.thumbnailUrl as string | null | undefined) ?? null,
+      author: buildTrackAuthor(track as never),
+      footer: scrobblerFooter,
+    });
+
+    const payload: MessagePayload = {
+      embeds: [embed],
+      allowed_mentions: { parse: [], users: [], roles: [], replied_user: false },
+    };
+
+    const existing = this.nowPlayingMessages.get(messageKey);
+    if (existing && existing.channelId === channelId && !existing.isCard) {
+      const edited = await this.rest.editMessage(channelId, existing.messageId, payload).catch(() => null);
+      if (edited) return true;
+      this.nowPlayingMessages.delete(messageKey);
+    }
+    if (existing?.isCard) {
+      await this.rest.deleteMessage?.(existing.channelId, existing.messageId).catch(() => null);
+      this.nowPlayingMessages.delete(messageKey);
+    }
+
+    const sent = await this.rest.sendMessage(channelId, payload).catch((error: unknown) => {
+      this.logger?.debug?.('Failed to publish now playing message', {
+        guildId,
+        channelId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    if (!sent) return false;
+
+    const messageId = String((sent as { id?: unknown })?.id ?? '').trim();
+    if (messageId) this.nowPlayingMessages.set(messageKey, { channelId, messageId });
+    return true;
+  }
+
+  async _publishNowPlayingCard(
+    session: SessionLookup | null | undefined,
+    track: Record<string, unknown>,
+    channelId: string,
+    messageKey: string,
+    requestedBy: string,
+    scrobblerFooter: string | null,
+    eventT: ReturnType<typeof createTranslator>,
+  ): Promise<boolean> {
+    if (!this.rest.sendFile) return false;
+    const guildConfig = await this._resolveGuildConfig(String(session?.guildId ?? '').trim() || null);
+    if (!isCardEnabled(guildConfig?.settings?.nowPlayingCard, this.config.nowPlayingCardEnabled !== false)) return false;
+
+    const pending = Array.isArray(session?.player?.pendingTracks) ? session.player.pendingTracks : [];
+    const card = await buildNowPlayingCardFile(track as CardTrack, {
+      upNext: (pending[0] as CardTrack | undefined) ?? null,
+      queueLength: pending.length,
+      labels: {
+        upNext: eventT('card.upNext'),
+        live: eventT('card.live'),
+        moreInQueue: eventT('card.moreInQueue', { count: '{count}' }),
+      },
+    });
+    if (!card) return false;
+
+    const voiceChannelId = String(session?.connection?.channelId ?? '').trim();
+    const details = [
+      requestedBy ? eventT('card.requestedBy', { user: `<@${requestedBy}>` }) : eventT('card.autoplay'),
+      voiceChannelId ? `<#${voiceChannelId}>` : null,
+      scrobblerFooter,
+    ].filter(Boolean).join(' | ');
+
+    const sent = await this.rest.sendFile(channelId, {
+      ...card,
+      description: String(track?.title ?? '').slice(0, 1000) || null,
+    }, {
+      content: subtext(details),
+      allowed_mentions: { parse: [], users: [], roles: [], replied_user: false },
+    }).catch((error: unknown) => {
+      this.logger?.debug?.('Failed to publish now playing card', {
+        channelId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    });
+    if (!sent) return false;
+
+    const previous = this.nowPlayingMessages.get(messageKey);
+    if (previous) {
+      await this.rest.deleteMessage?.(previous.channelId, previous.messageId).catch(() => null);
+    }
+    const messageId = String((sent as { id?: unknown })?.id ?? '').trim();
+    if (messageId) this.nowPlayingMessages.set(messageKey, { channelId, messageId, isCard: true });
+    else this.nowPlayingMessages.delete(messageKey);
+    return true;
+  }
+
+  _nowPlayingKey(session: SessionLookup | null | undefined): string {
+    const sessionId = String(session?.sessionId ?? '').trim();
+    return sessionId || String(session?.guildId ?? '').trim();
+  }
+
+  async _emitWebhookEvent(session: SessionLookup | null | undefined, type: string, text: string) {
+    const guildId = String(session?.guildId ?? '').trim();
+    if (!this.library || !guildId) return;
+    const cfg = await this.library.getGuildFeatureConfig?.(guildId).catch(() => null);
+    const webhookUrl = cfg?.webhookUrl ?? null;
+    if (!webhookUrl || !/^https?:\/\//.test(String(webhookUrl))) return;
+
+    const payload = {
+      content: `[music:${type}] ${text}`.slice(0, 1900),
+    };
+
+    await safeFetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(8_000),
+    }).catch(() => null);
+  }
+
+  _startBackgroundTasks() {
+    const cleanup = () => {
+      const now = Date.now();
+      for (const [key, state] of this.helpPaginations.entries()) {
+        if ((now - state.updatedAt) > (30 * 60 * 1000)) {
+          this.helpPaginations.delete(key);
+        }
+      }
+      for (const [key, state] of this.searchReactionSelections.entries()) {
+        if (now > state.expiresAt) {
+          this.searchReactionSelections.delete(key);
+        }
+      }
+      for (const [key, sentAt] of this.commandChannelNotices.entries()) {
+        if ((now - sentAt) > COMMAND_CHANNEL_NOTICE_COOLDOWN_MS) {
+          this.commandChannelNotices.delete(key);
+        }
+      }
+      for (const [key, startedAt] of this.guildOpLocks.entries()) {
+        if ((now - startedAt) > (5 * 60 * 1000)) {
+          this.guildOpLocks.delete(key);
+        }
+      }
+    };
+    cleanup();
+    this.ephemeralCleanupHandle = setInterval(cleanup, 5 * 60 * 1000);
+    this.ephemeralCleanupHandle.unref?.();
+
+    if (!this.library?.buildGuildRecap || !this.library?.getRecapState) return;
+    const run = () => {
+      this._runWeeklyRecapSweep().catch((err) => {
+        this.logger?.warn?.('Weekly recap sweep failed', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    };
+    this.weeklySweepHandle = setInterval(run, 60 * 60 * 1000);
+    this.weeklySweepHandle.unref?.();
+    run();
+  }
+
+  async _registerHelpPagination(channelId: string, messageId: string, pages: MessagePayload[], index?: number) {
+    return registerHelpPagination(this, channelId, messageId, pages, index);
+  }
+
+  async _runWeeklyRecapSweep() {
+    return runWeeklyRecapSweep(this);
+  }
+
+  async _sendPaginated(channelId: string, pages: MessagePayload[], replyOptions: ReplyOptions | null = null) {
+    return sendPaginated(this as Parameters<typeof sendPaginated>[0], channelId, pages, replyOptions);
+  }
+
+  async _registerSearchReactionSelection({
+    guildId,
+    channelId,
+    messageId,
+    userId,
+    tracks,
+    timeoutMs = null,
+  }: {
+    guildId: string | null;
+    channelId: string;
+    messageId: string;
+    userId: string | null;
+    tracks: unknown[];
+    timeoutMs?: number | null;
+  }) {
+    return registerSearchReactionSelection(this as Parameters<typeof registerSearchReactionSelection>[0], {
+      guildId: guildId ?? '',
+      channelId,
+      messageId,
+      userId: userId ?? '',
+      tracks,
+      timeoutMs,
+    });
+  }
+
+  async _applySearchReactionSelection(state: SearchReactionState, pickedIndex: number, userId: string) {
+    return applySearchReactionSelection(this, state, pickedIndex, userId);
+  }
+
+  async _safeReply(
+    channelId: string,
+    type: string,
+    text: string,
+    fields: unknown = null,
+    replyOptions: ReplyOptions | null = null,
+    embedOptions: unknown = null
+  ) {
+    return safeReply(
+      this as Parameters<typeof safeReply>[0],
+      channelId,
+      type,
+      text,
+      fields as Parameters<typeof safeReply>[4],
+      replyOptions,
+      embedOptions as Parameters<typeof safeReply>[6]
+    );
+  }
+
+}
+
+
+
+
+

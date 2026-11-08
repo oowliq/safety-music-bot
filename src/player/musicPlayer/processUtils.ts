@@ -1,0 +1,194 @@
+import { ValidationError } from '../../core/errors.ts';
+import {
+  isConnectionRefusedError,
+} from './errorUtils.ts';
+import type { MusicPlayer } from '../MusicPlayer.ts';
+
+type ProcessUtilsPlayer = MusicPlayer & {
+  pipelineErrorHandlers: unknown[];
+};
+type ErrorAwareStream = {
+  on?: (event: string, listener: (err: unknown) => void) => unknown;
+  off?: (event: string, listener: (err: unknown) => void) => unknown;
+} | null | undefined;
+
+export function cleanupProcesses(player: ProcessUtilsPlayer) {
+  const sourceProc = player.sourceProc;
+  const ffmpeg = player.ffmpeg;
+
+  const playbackSource = player.playbackSourceStream ?? ffmpeg?.stdout ?? null;
+
+  try {
+    if (playbackSource && player.liveAudioProcessor) {
+      playbackSource.unpipe?.(player.liveAudioProcessor as unknown as NodeJS.WritableStream);
+    }
+  } catch {}
+
+  try {
+    if (playbackSource && player.playbackOutputStream) {
+      playbackSource.unpipe?.(player.playbackOutputStream);
+    }
+  } catch {}
+
+  try {
+    if (player.liveAudioProcessor && player.playbackOutputStream) {
+      player.liveAudioProcessor.unpipe?.(player.playbackOutputStream);
+    }
+  } catch {}
+
+  try {
+    if (sourceProc?.stdout && ffmpeg?.stdin) {
+      sourceProc.stdout.unpipe?.(ffmpeg.stdin as unknown as NodeJS.WritableStream);
+    }
+  } catch {}
+
+  try {
+    if (player.sourceStream && ffmpeg?.stdin) {
+      player.sourceStream.unpipe?.(ffmpeg.stdin as unknown as NodeJS.WritableStream);
+    }
+  } catch {}
+
+  try {
+    player.liveAudioProcessor?.destroy?.();
+  } catch {}
+  player.liveAudioProcessor = null;
+
+  try {
+    player.playbackOutputStream?.destroy?.();
+  } catch {}
+  player.playbackOutputStream = null;
+
+  try {
+    player.sourceStream?.destroy?.();
+  } catch {}
+  player.sourceStream = null;
+  player.playbackSourceStream = null;
+
+  try {
+    sourceProc?.stdout?.destroy?.();
+  } catch {}
+  try {
+    sourceProc?.stderr?.destroy?.();
+  } catch {}
+  try {
+    sourceProc?.stdin?.destroy?.();
+  } catch {}
+
+  sourceProc?.kill?.('SIGKILL');
+  player.sourceProc = null;
+
+  try {
+    ffmpeg?.stdin?.destroy?.();
+  } catch {}
+  try {
+    ffmpeg?.stdout?.destroy?.();
+  } catch {}
+  try {
+    ffmpeg?.stderr?.destroy?.();
+  } catch {}
+
+  ffmpeg?.kill?.('SIGKILL');
+  player.ffmpeg = null;
+  player.activeSourceProcessCloseInfo = null;
+  clearPipelineErrorHandlers(player);
+}
+
+export function clearPipelineState(player: ProcessUtilsPlayer) {
+  clearPipelineErrorHandlers(player);
+  player.liveAudioProcessor = null;
+  player.playbackOutputStream = null;
+  player.sourceStream = null;
+  player.playbackSourceStream = null;
+  player.activeSourceProcessCloseInfo = null;
+}
+
+export function stopVoiceStream(player: ProcessUtilsPlayer) {
+  const stopAudio = (player.voice as { stopAudio?: () => unknown } | null | undefined)?.stopAudio;
+  if (typeof stopAudio !== 'function') return;
+  try {
+    stopAudio.call(player.voice);
+  } catch {}
+}
+
+export function clearPipelineErrorHandlers(player: ProcessUtilsPlayer) {
+  for (const unbind of player.pipelineErrorHandlers) {
+    if (typeof unbind !== 'function') continue;
+    try {
+      unbind();
+    } catch {}
+  }
+  player.pipelineErrorHandlers = [];
+}
+
+export function bindPipelineErrorHandler(player: ProcessUtilsPlayer, stream: unknown, label: string) {
+  const targetStream = stream as ErrorAwareStream;
+  if (!targetStream?.on || !targetStream?.off) return;
+
+  const onError = (err: unknown) => {
+    if (isExpectedPipeError(err)) {
+      player.logger?.debug?.('Ignoring expected pipeline error', {
+        label,
+        code: err instanceof Error && 'code' in err ? (err as { code?: unknown }).code ?? null : null,
+      });
+      return;
+    }
+
+    player.logger?.warn?.('Pipeline stream error', {
+      label,
+      code: err instanceof Error && 'code' in err ? (err as { code?: unknown }).code ?? null : null,
+      error: err instanceof Error ? err.message : String(err),
+      cause: describeErrorCause(err),
+    });
+  };
+
+  targetStream.on('error', onError);
+  player.pipelineErrorHandlers.push(() => {
+    targetStream.off?.('error', onError);
+  });
+}
+
+export function describeErrorCause(err: unknown): string | null {
+  const cause = err && typeof err === 'object' ? (err as { cause?: unknown }).cause : undefined;
+  if (cause == null) return null;
+  if (typeof cause !== 'object') return String(cause);
+  const code = (cause as { code?: unknown }).code;
+  const message = (cause as { message?: unknown }).message;
+  const prefix = typeof code === 'string' && code ? `${code}: ` : '';
+  return `${prefix}${String(message ?? cause)}`;
+}
+
+export function isExpectedPipeError(err: unknown) {
+  const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined;
+  return code === 'EPIPE' || code === 'ERR_STREAM_DESTROYED' || code === 'ECONNRESET';
+}
+
+export function startPlaybackClock(player: ProcessUtilsPlayer, offsetSec: unknown) {
+  player.currentTrackOffsetSec = Math.max(0, Number.parseInt(String(offsetSec), 10) || 0);
+  player.trackStartedAtMs = Date.now();
+  player.pauseStartedAtMs = null;
+  player.totalPausedMs = 0;
+}
+
+export function resetPlaybackClock(player: ProcessUtilsPlayer) {
+  player.trackStartedAtMs = null;
+  player.pauseStartedAtMs = null;
+  player.totalPausedMs = 0;
+  player.currentTrackOffsetSec = 0;
+  player.receivedPcmBytes = null;
+}
+
+export function normalizePlaybackError(player: ProcessUtilsPlayer, err: unknown) {
+  const errno = err && typeof err === 'object' ? err as { code?: unknown; path?: unknown } : null;
+  if (errno?.code === 'ENOENT' && (errno.path === player.ffmpegBin || errno.path === 'ffmpeg')) {
+    return new Error('FFmpeg is not available. Install ffmpeg or set FFMPEG_BIN.');
+  }
+  if (isConnectionRefusedError(err)) {
+    return new Error('Network connection refused during media fetch. Check proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) and remove localhost:9 mappings.');
+  }
+
+  if (err instanceof ValidationError) return err;
+  if (err instanceof Error) return err;
+  return new Error(String(err));
+}
+
+

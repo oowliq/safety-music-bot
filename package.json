@@ -1,0 +1,50 @@
+{
+  "name": "safety-music-bot",
+  "version": "1.0.0",
+  "description": "Safety Music Bot: a hardened Fluxer music bot (NodeLink-only playback, no eval/dashboard/telemetry). Based on Vinto-Music (MIT).",
+  "license": "SEE LICENSE IN LICENSE",
+  "type": "module",
+  "packageManager": "pnpm@10.12.1",
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/src/index.js",
+    "dev": "node --import tsx --watch src/index.ts",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "keywords": [
+    "bot",
+    "music",
+    "fluxer",
+    "livekit",
+    "mongodb",
+    "nodelink"
+  ],
+  "dependencies": {
+    "@livekit/rtc-node": "^0.13.34",
+    "@napi-rs/canvas": "^1.1.0",
+    "dotenv": "^17.4.2",
+    "mongodb": "^7.6.0",
+    "undici": "^8.12.4",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.23.12",
+    "typescript": "^6.0.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ],
+    "overrides": {
+      "ws@>=8.0.0 <8.21.0": ">=8.21.3",
+      "brace-expansion@<5.0.9": ">=5.0.9",
+      "esbuild@>=0.27.3 <0.28.1": ">=0.28.1"
+    }
+  }
+}

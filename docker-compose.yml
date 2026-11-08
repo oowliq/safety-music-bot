@@ -1,0 +1,186 @@
+# Bot + NodeLink + yt-cipher + MongoDB.
+#
+#   cp env.example .env      # fill in at least the REQUIRED block
+#   docker compose up -d     # pulls BOT_IMAGE from GHCR (or builds locally if unset)
+#   docker compose logs -f bot nodelink
+#
+# Local build instead of the published image:  docker compose up -d --build
+#
+# No ports are published: the bot only makes outbound connections, NodeLink and
+# Mongo are reachable only from inside this compose project.
+
+name: safety-music-bot
+
+services:
+  bot:
+    build:
+      context: .
+      target: runtime
+    # Published by .github/workflows/ci.yml, e.g. BOT_IMAGE=ghcr.io/<owner>/<repo>:latest
+    image: ${BOT_IMAGE:-safety-music-bot:local}
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+      nodelink:
+        condition: service_started
+    env_file: .env
+    environment:
+      # Password must be URL-safe (letters/digits), it is embedded into the URI.
+      MONGODB_URI: mongodb://${MONGO_BOT_USER:-musicbot}:${MONGO_BOT_PASSWORD:?set MONGO_BOT_PASSWORD in .env}@mongo:27017/${MONGODB_DB:-fluxer_music_bot}?authSource=${MONGODB_DB:-fluxer_music_bot}
+      MONGODB_DB: ${MONGODB_DB:-fluxer_music_bot}
+      NODELINK_BASE_URL: http://nodelink:3000
+      NODELINK_PASSWORD: ${NODELINK_PASSWORD:?set NODELINK_PASSWORD in .env}
+      MONITORING_HOST: 127.0.0.1
+      HEAP_SNAPSHOT_SIGNAL_ENABLED: "0"
+      # Root FS is read-only; native libs (pulse config probe in LiveKit) write under $HOME.
+      HOME: /tmp
+    user: "1000:1000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1536m
+    networks:
+      - backend
+      - egress
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+
+  nodelink:
+    # Official PerformanC NodeLink, dev channel (YouTube clients, SABR and built-in
+    # PO-token generation are only current there). Pinned by digest: update on purpose.
+    # Newest builds: https://hub.docker.com/r/performanc/nodelink/tags (dev-<sha>).
+    image: ${NODELINK_IMAGE:-performanc/nodelink:dev-ba414f9@sha256:9355b8731ac720ce5948a5b4fbcf0158996eec8808688c0359075aa6656cd001}
+    restart: unless-stopped
+    depends_on:
+      yt-cipher:
+        condition: service_started
+    # Env names mirror the config path: api.enableLoadStreamEndpoint -> NODELINK_API_ENABLELOADSTREAMENDPOINT.
+    environment:
+      NODELINK_SERVER_HOST: 0.0.0.0
+      NODELINK_SERVER_PORT: "3000"
+      NODELINK_SERVER_PASSWORD: ${NODELINK_PASSWORD:?set NODELINK_PASSWORD in .env}
+      NODELINK_LOGGING_LEVEL: ${NODELINK_LOGGING_LEVEL:-info}
+      # The bot streams through /v4/loadstream; nothing else is needed.
+      NODELINK_API_ENABLELOADSTREAMENDPOINT: "true"
+      NODELINK_API_ENABLETRACKSTREAMENDPOINT: "false"
+      NODELINK_API_ENABLEHLSENDPOINT: "false"
+      NODELINK_API_METRICS_ENABLED: "false"
+      NODELINK_SEARCH_MAXRESULTS: ${NODELINK_SEARCH_MAXRESULTS:-10}
+      NODELINK_SEARCH_DEFAULTSOURCE: ${NODELINK_SEARCH_DEFAULTSOURCE:-youtube,soundcloud}
+      NODELINK_SEARCH_UNIFIEDSOURCES: ${NODELINK_SEARCH_UNIFIEDSOURCES:-youtube,soundcloud}
+      NODELINK_PLAYBACK_MAXPLAYLISTLENGTH: ${MAX_PLAYLIST_TRACKS:-25}
+      # Hardening: no local-file source (would read files inside the container) and
+      # no generic HTTP source (SSRF). The bot plays plain HTTP audio/radio itself.
+      NODELINK_SOURCES_LOCAL_ENABLED: "false"
+      NODELINK_SOURCES_HTTP_ENABLED: "false"
+      NODELINK_SOURCES_YOUTUBE_ENABLED: "true"
+      NODELINK_SOURCES_SOUNDCLOUD_ENABLED: "true"
+      # Self-hosted signature deciphering (below) instead of the public cipher.kikkia.dev.
+      NODELINK_SOURCES_YOUTUBE_CIPHER_URL: http://yt-cipher:8001
+      # Optional YouTube knobs, all empty by default:
+      #  - proxies: JSON array of proxy URLs if your IP gets "Sign in to confirm you're not a bot"
+      #  - TV refresh token: OAuth of a THROWAWAY Google account (never your main one)
+      NODELINK_SOURCES_YOUTUBE_PROXIES: ${NODELINK_SOURCES_YOUTUBE_PROXIES:-[]}
+      NODELINK_SOURCES_YOUTUBE_CLIENTS_SETTINGS_TV_REFRESHTOKEN: ${NODELINK_SOURCES_YOUTUBE_CLIENTS_SETTINGS_TV_REFRESHTOKEN:-[]}
+      # Optional: Spotify metadata for Spotify links (leave empty if not needed).
+      NODELINK_SOURCES_SPOTIFY_CLIENTID: ${SPOTIFY_CLIENT_ID:-}
+      NODELINK_SOURCES_SPOTIFY_CLIENTSECRET: ${SPOTIFY_CLIENT_SECRET:-}
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 1024
+    mem_limit: 2g
+    networks:
+      - egress
+    logging:
+      driver: json-file
+      options:
+        max-size: 25m
+        max-file: "3"
+
+  yt-cipher:
+    # kikkia/yt-cipher only publishes `master`; pinned by digest.
+    image: ${YT_CIPHER_IMAGE:-ghcr.io/kikkia/yt-cipher:master@sha256:4c5ec381ff57336cfc24822d2b526a5ad7cd0171f61065a1bbc87bb736842449}
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8001"
+      MAX_THREADS: "2"
+      PREPROCESSED_CACHE_SIZE: "150"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    networks:
+      - egress
+    logging:
+      driver: json-file
+      options:
+        max-size: 25m
+        max-file: "3"
+
+  mongo:
+    image: mongo:7.0.43@sha256:1f995ad6fdb93244a1addab1b58f934a0bc2f5643c38e02f5e9d7f0c7d227a7b
+    restart: unless-stopped
+    command: ["--auth", "--bind_ip_all"]
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:?set MONGO_ROOT_PASSWORD in .env}
+      MONGO_INITDB_DATABASE: ${MONGODB_DB:-fluxer_music_bot}
+      MONGO_BOT_USER: ${MONGO_BOT_USER:-musicbot}
+      MONGO_BOT_PASSWORD: ${MONGO_BOT_PASSWORD:?set MONGO_BOT_PASSWORD in .env}
+    volumes:
+      - mongo_data:/data/db
+    configs:
+      - source: mongo-init
+        target: /docker-entrypoint-initdb.d/10-bot-user.js
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"quit(db.adminCommand({ ping: 1 }).ok ? 0 : 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 25m
+        max-file: "3"
+
+networks:
+  # Mongo lives only here and has no route outside the host.
+  backend:
+    internal: true
+  # Outbound access for the bot and NodeLink (Fluxer, YouTube & co, radio streams).
+  # On a server, block LAN/management subnets for this network with host firewall rules.
+  egress: {}
+
+volumes:
+  mongo_data:
+
+configs:
+  # Runs once on the first start of an empty Mongo volume: creates a least-privilege
+  # user for the bot (readWrite on its own database only).
+  mongo-init:
+    content: |
+      const dbName = process.env.MONGO_INITDB_DATABASE || 'fluxer_music_bot';
+      const user = process.env.MONGO_BOT_USER || 'musicbot';
+      const password = process.env.MONGO_BOT_PASSWORD;
+      if (!password) throw new Error('MONGO_BOT_PASSWORD is required');
+      db.getSiblingDB(dbName).createUser({
+        user,
+        pwd: password,
+        roles: [{ role: 'readWrite', db: dbName }],
+      });
