@@ -7,8 +7,9 @@ name: CI
 # Dependabot (.github/dependabot.yml) proposes updates.
 
 on:
+  # Branch pushes other than master (e.g. dependabot/*) are covered by their pull_request run.
   push:
-    branches: ["**"]
+    branches: [master, main]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:

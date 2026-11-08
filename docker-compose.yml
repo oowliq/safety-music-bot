@@ -1,7 +1,12 @@
 # Bot + NodeLink + yt-cipher + MongoDB.
 #
-#   cp env.example .env      # fill in at least the REQUIRED block
-#   docker compose up -d     # pulls BOT_IMAGE from GHCR (or builds locally if unset)
+#   cp .env.example .env         # infrastructure secrets (Mongo, NodeLink) + images
+#   cp bot.env.example bot.env   # bot settings (token, Fluxer URLs, behaviour)
+#   docker compose up -d         # pulls BOT_IMAGE from GHCR (or builds locally if unset)
+#
+# Secrets are split on purpose: the bot container never sees the Mongo root password,
+# the YouTube refresh token or provider keys. It only gets its own Mongo URI and the
+# NodeLink password.
 #   docker compose logs -f bot nodelink
 #
 # Local build instead of the published image:  docker compose up -d --build
@@ -24,7 +29,9 @@ services:
         condition: service_healthy
       nodelink:
         condition: service_started
-    env_file: .env
+    env_file:
+      - path: bot.env
+        required: true
     environment:
       # Password must be URL-safe (letters/digits), it is embedded into the URI.
       MONGODB_URI: mongodb://${MONGO_BOT_USER:-musicbot}:${MONGO_BOT_PASSWORD:?set MONGO_BOT_PASSWORD in .env}@mongo:27017/${MONGODB_DB:-fluxer_music_bot}?authSource=${MONGODB_DB:-fluxer_music_bot}
@@ -35,6 +42,14 @@ services:
       HEAP_SNAPSHOT_SIGNAL_ENABLED: "0"
       # Root FS is read-only; native libs (pulse config probe in LiveKit) write under $HOME.
       HOME: /tmp
+      # Defence in depth: blank infrastructure secrets in case they were put into bot.env.
+      MONGO_ROOT_USER: ""
+      MONGO_ROOT_PASSWORD: ""
+      MONGO_BOT_PASSWORD: ""
+      NODELINK_SOURCES_YOUTUBE_CLIENTS_SETTINGS_TV_REFRESHTOKEN: ""
+      NODELINK_SOURCES_YOUTUBE_PROXIES: ""
+      SPOTIFY_CLIENT_ID: ""
+      SPOTIFY_CLIENT_SECRET: ""
     user: "1000:1000"
     read_only: true
     tmpfs:
@@ -76,7 +91,7 @@ services:
       NODELINK_SEARCH_MAXRESULTS: ${NODELINK_SEARCH_MAXRESULTS:-10}
       NODELINK_SEARCH_DEFAULTSOURCE: ${NODELINK_SEARCH_DEFAULTSOURCE:-youtube,soundcloud}
       NODELINK_SEARCH_UNIFIEDSOURCES: ${NODELINK_SEARCH_UNIFIEDSOURCES:-youtube,soundcloud}
-      NODELINK_PLAYBACK_MAXPLAYLISTLENGTH: ${MAX_PLAYLIST_TRACKS:-25}
+      NODELINK_PLAYBACK_MAXPLAYLISTLENGTH: ${NODELINK_PLAYBACK_MAXPLAYLISTLENGTH:-100}
       # Hardening: no local-file source (would read files inside the container) and
       # no generic HTTP source (SSRF). The bot plays plain HTTP audio/radio itself.
       NODELINK_SOURCES_LOCAL_ENABLED: "false"
@@ -163,9 +178,13 @@ networks:
   # Mongo lives only here and has no route outside the host.
   backend:
     internal: true
-  # Outbound access for the bot and NodeLink (Fluxer, YouTube & co, radio streams).
-  # On a server, block LAN/management subnets for this network with host firewall rules.
-  egress: {}
+  # Outbound access for the bot, NodeLink and yt-cipher (Fluxer, YouTube & co, radio).
+  # Fixed subnet so the host firewall can block LAN/management ranges for it:
+  # see SECURITY.md ("Egress firewall").
+  egress:
+    ipam:
+      config:
+        - subnet: ${EGRESS_SUBNET:-172.30.250.0/24}
 
 volumes:
   mongo_data:

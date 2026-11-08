@@ -22,3 +22,6 @@ cookies.txt
 .cache/tidal-token.json
 /--Frag*
 .claude
+
+# bot settings (contain BOT_TOKEN)
+bot.env

@@ -36,17 +36,26 @@ favourites, filters/EQ, radio, lyrics, 24/7, DJ roles, stats, templates, …) is
    publishes them to `ghcr.io/<owner>/<repo>` (`latest`, `sha-<short>`, semver tags) with
    SBOM and build provenance. Verify an image with
    `gh attestation verify oci://ghcr.io/<owner>/<repo>:latest --owner <owner>`.
-2. `cp env.example .env`, fill in the REQUIRED block, point `API_BASE`/`GATEWAY_URL` at your
-   Fluxer and set `BOT_IMAGE=ghcr.io/<owner>/<repo>:latest`.
+2. Create the two env files and fill in their REQUIRED blocks:
+   - `cp .env.example .env`: infrastructure secrets (Mongo, NodeLink, YouTube token) and images.
+     Set `BOT_IMAGE=ghcr.io/<owner>/<repo>:latest`.
+   - `cp bot.env.example bot.env`: bot token, Fluxer URLs (`API_BASE`, `GATEWAY_URL`) and behaviour.
+
+   The bot container only receives `bot.env` plus its own Mongo URI and the NodeLink password;
+   the Mongo root password and provider tokens never reach it.
    For a private package run `docker login ghcr.io` with a PAT that has `read:packages`.
 3. Start: `docker compose up -d`. Update: `docker compose pull && docker compose up -d`.
    Without `BOT_IMAGE`, `docker compose up -d --build` builds the image locally.
 
-`docker-compose.yml` runs the bot, NodeLink (official dev build pinned by digest) with a self-hosted yt-cipher and MongoDB, and publishes
-no ports. The bot runs read-only as UID 1000 with `cap_drop: ALL` and `no-new-privileges`.
-NodeLink runs with its `local` (file) and `http` (arbitrary URL) sources and metrics disabled.
-MongoDB has auth, a least-privilege user and sits on an `internal` network. Block your LAN or
-management subnets for the `egress` network with host firewall rules.
+`docker-compose.yml` runs the bot, NodeLink (official dev build pinned by digest), a self-hosted
+yt-cipher and MongoDB, and publishes no ports.
+
+- Bot: read-only root FS, UID 1000, `cap_drop: ALL`, `no-new-privileges`.
+- NodeLink: the `local` source (reads files) is **disabled**, the `http` source (fetches arbitrary
+  URLs) is **disabled**, metrics are **disabled**. Only `loadstream` is enabled for the bot.
+- MongoDB: auth enabled, least-privilege `musicbot` user, `internal` network only.
+- Egress: the `egress` network has a fixed subnet (`EGRESS_SUBNET`). Block your LAN for it on
+  the host; ready-made rules are in [SECURITY.md](SECURITY.md#egress-firewall).
 
 ## Development
 
@@ -56,4 +65,4 @@ pnpm run typecheck
 pnpm test
 ```
 
-Tests run in CI inside the image (`docker build --target test .`).
+CI runs the same commands on every push and pull request; `docker build --target test .` runs them inside the image.

@@ -16,3 +16,6 @@ cookies.txt
 assets/*
 !assets/fonts
 docker-compose*.yml
+bot.env
+*.env.example
+env-example.tmp

@@ -1,4 +1,9 @@
 version: 2
+
+# Minor/patch updates only, grouped into one PR per ecosystem, at least 14 days old.
+# Major upgrades (Node, MongoDB, TypeScript, libraries) are done by hand: they can need
+# code changes or data migrations (MongoDB must go 7 -> 8 -> 9, never skipping a major).
+
 updates:
   # GitHub Actions are pinned by SHA; Dependabot bumps SHA + version comment.
   - package-ecosystem: github-actions
@@ -7,6 +12,12 @@ updates:
       interval: weekly
     cooldown:
       default-days: 14
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   # Node base image in the Dockerfile (tag + digest).
   - package-ecosystem: docker
@@ -15,14 +26,23 @@ updates:
       interval: weekly
     cooldown:
       default-days: 14
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
-  # NodeLink / yt-cipher / Mongo pins in docker-compose.yml.
+  # Mongo / yt-cipher / NodeLink pins in docker-compose.yml.
   - package-ecosystem: docker-compose
     directory: /
     schedule:
       interval: weekly
     cooldown:
       default-days: 14
+    groups:
+      compose-images:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: npm
     directory: /
@@ -30,4 +50,10 @@ updates:
       interval: weekly
     cooldown:
       default-days: 14
+    groups:
+      npm-minor-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 5
