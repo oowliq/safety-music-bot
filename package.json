@@ -25,7 +25,7 @@
     "nodelink"
   ],
   "dependencies": {
-    "@livekit/rtc-node": "^0.13.34",
+    "@livekit/rtc-node": "^1.2.1",
     "@napi-rs/canvas": "^1.1.0",
     "dotenv": "^17.4.2",
     "mongodb": "^7.6.0",
