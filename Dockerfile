@@ -6,7 +6,7 @@
 # - Runs as the unprivileged `node` user, no package manager or corepack at runtime.
 #
 # The base image is pinned by tag + digest; Dependabot (.github/dependabot.yml) proposes updates.
-FROM node:24.22.0-bookworm-slim@sha256:91acba91b842bec0bf7ea6f5e09c644c7ccad72c4996ed9616d861d1c7cd60d4 AS base
+FROM node:26.12.0-bookworm-slim@sha256:742a0fe7320e09e0321222b68165e6ac731d30470e7ea7f98f9bfc3a6e1034fe AS base
 
 FROM base AS deps
 WORKDIR /app
